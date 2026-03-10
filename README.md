@@ -25,7 +25,7 @@ conda env create -f environment.yml
 ```
 
 ## 数据准备：
-使用VGGSound数据集来混合生成2~5mix的训练集、验证集和测试集，其中VGGSound数据集路径在/work107/luoxiaoxue/data/VGGSound。后续需要添加华为提供的部分数据，其路径在/work105/duwenqiang/DATA/huawei/speech separation。
+使用VGGSound数据集来混合生成2~5mix的训练集、验证集和测试集，其中VGGSound数据集路径在/work107/luoxiaoxue/data/VGGSound。后续需要添加华为提供的部分数据，其路径在/work107/luoxiaoxue/data/Huawei。
 ```bash
 python create_csv.py  --input_csv /dataset/3class_data_nosing/train.csv  --output_csv dataset/3class_data_nosing/metadata/train_3mix.csv  --num_sources 3  --dataset_type train
 ```
