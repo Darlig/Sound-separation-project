@@ -4,7 +4,8 @@ import argparse
 from pathlib import Path
 
 def load_original_csv(csv_path):
-    df = pd.read_csv(csv_path, header=None, names=['filename', 'label'])
+    #df = pd.read_csv(csv_path)
+    df = pd.read_csv(csv_path, header=None, names=['filename', 'label', 'category'])
     return df
 
 def categorize_label(label):
@@ -47,6 +48,7 @@ def generate_mixed_csv(original_df, output_csv, num_samples, num_sources):
     
     target_df = original_df[original_df['label'].isin(target_labels)]
     
+    print(original_df['label'].unique()[:20])
     if target_df.empty:
         print("错误: 未找到目标标签的数据")
         return
@@ -116,6 +118,7 @@ def main():
     
     print(f"原始数据形状: {original_df.shape}")
     print(f"开始生成{args.type}数据，样本数: {num_samples}")
+    print(f"original_df:\n{original_df.head()}\n...")
     
     generate_mixed_csv(
         original_df=original_df,

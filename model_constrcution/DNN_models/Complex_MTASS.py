@@ -214,7 +214,7 @@ class Conv1d_sub(nn.Module):
     def __init__(self, input_dim, output_dim, k, dila):
         super(Conv1d_sub, self).__init__()
         self.input_dim, self.output_dim, self.k, self.dila = input_dim, output_dim, k, dila
-        self.is_causal = False
+        self.is_causal = True
         if self.is_causal:
             pad = nn.ConstantPad1d((2*self.dila, 0), value=0.)
         else:
@@ -386,7 +386,7 @@ class GLU(nn.Module):
     def __init__(self, dilation):
         super(GLU, self).__init__()
         self.apply_self_attn = False
-        self.is_causal = False
+        self.is_causal = True
         self.dropout = nn.Dropout(0.1)
 
         if self.is_causal:

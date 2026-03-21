@@ -187,7 +187,7 @@ def test(args):
 
     with torch.no_grad():
         for batch in tqdm(test_loader):
-            X1, T1, R_targets, idx = batch
+            X1, R_targets, idx = batch
             X1 = X1.to(device)
 
             R_gt_speech = R_targets[0].to(device)
