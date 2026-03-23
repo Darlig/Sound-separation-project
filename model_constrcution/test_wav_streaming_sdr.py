@@ -335,23 +335,28 @@ def main():
             music_gt = music_gt.astype(np.float32) / 32767.0
             others_gt = others_gt.astype(np.float32) / 32767.0
         
+        eps = 1e-8
+        valid_speech = np.sum(speech_gt ** 2) > eps
+        valid_music = np.sum(music_gt ** 2) > eps
+        valid_others = np.sum(others_gt ** 2) > eps
+        
         speech_es, music_es, others_es = separator.process_file(mixture_path, output_sample_dir, fs)
         
-        if speech_es is not None:
+        if valid_speech and speech_es is not None:
             min_len = min(len(speech_es), len(speech_gt))
             speech_sdr = sdr_cost(speech_es[:min_len], speech_gt[:min_len])
             speech_sisdr = sisdr_cost(speech_es[:min_len], speech_gt[:min_len])
             all_speech_sdr.append(speech_sdr)
             all_speech_sisdr.append(speech_sisdr)
         
-        if music_es is not None:
+        if valid_music and music_es is not None:
             min_len = min(len(music_es), len(music_gt))
             music_sdr = sdr_cost(music_es[:min_len], music_gt[:min_len])
             music_sisdr = sisdr_cost(music_es[:min_len], music_gt[:min_len])
             all_music_sdr.append(music_sdr)
             all_music_sisdr.append(music_sisdr)
         
-        if others_es is not None:
+        if valid_others and others_es is not None:
             min_len = min(len(others_es), len(others_gt))
             others_sdr = sdr_cost(others_es[:min_len], others_gt[:min_len])
             others_sisdr = sisdr_cost(others_es[:min_len], others_gt[:min_len])
