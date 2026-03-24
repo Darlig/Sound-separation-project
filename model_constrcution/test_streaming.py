@@ -170,7 +170,7 @@ def test_non_streaming(args, model, test_loader, device):
 
     with torch.no_grad():
         for batch in tqdm(test_loader, desc="Non-streaming"):
-            X1, T1, R_targets, idx = batch
+            X1, R_targets, idx = batch
             X1 = X1.to(device)
 
             R_gt_speech = R_targets[0].to(device)
@@ -211,7 +211,7 @@ def test_streaming(args, model, test_loader, device, chunk_size=1):
 
     with torch.no_grad():
         for batch in tqdm(test_loader, desc=f"Streaming (chunk={chunk_size})"):
-            X1, T1, R_targets, idx = batch
+            X1, R_targets, idx = batch
             X1 = X1.to(device)
 
             R_gt_speech = R_targets[0].to(device)
