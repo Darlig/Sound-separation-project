@@ -238,6 +238,94 @@ class Conv1d_sub(nn.Module):
     def forward(self, x):
         x = self.unit(x)
         return x
+
+
+class StreamingConv1d(nn.Module):
+    """
+    Streaming version of causal Conv1d with state management.
+    
+    Maintains a buffer of input history to support streaming inference
+    with causal dilated convolutions.
+    """
+    def __init__(self, input_dim, output_dim, kernel_size, dilation, max_history_len=None):
+        super(StreamingConv1d, self).__init__()
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.kernel_size = kernel_size
+        self.dilation = dilation
+        
+        self.required_history = (kernel_size - 1) * dilation
+        self.max_history_len = max_history_len if max_history_len is not None else self.required_history * 2
+        
+        self.conv = nn.Conv1d(input_dim, output_dim, kernel_size, dilation=dilation, bias=False)
+        self.bn = nn.BatchNorm1d(output_dim)
+        self.relu = nn.ReLU(output_dim)
+        self.dropout = nn.Dropout(0.2)
+        
+        self.reset_state()
+    
+    def reset_state(self):
+        """Reset the internal buffer for new utterance."""
+        self.input_buffer = None
+    
+    def forward(self, x):
+        """Non-streaming forward pass (for training)."""
+        pad = nn.ConstantPad1d((self.required_history, 0), value=0.)
+        x_pad = pad(x)
+        x = self.conv(x_pad)
+        x = self.bn(x)
+        x = self.relu(x)
+        x = self.dropout(x)
+        return x
+    
+    def streaming_forward(self, x):
+        """
+        Streaming forward pass with state management.
+        
+        Args:
+            x: Input tensor of shape [batch, input_dim, current_len]
+        
+        Returns:
+            Output tensor of shape [batch, output_dim, current_len]
+        """
+        batch_size, _, current_len = x.shape
+        
+        if self.input_buffer is None:
+            self.input_buffer = torch.zeros(
+                batch_size, self.input_dim, self.required_history,
+                device=x.device, dtype=x.dtype
+            )
+        
+        full_input = torch.cat([self.input_buffer, x], dim=-1)
+        
+        self.input_buffer = full_input[:, :, -self.required_history:].detach()
+        
+        conv_out = self.conv(full_input)
+        
+        out = conv_out[:, :, -current_len:]
+        
+        out = self.bn(out)
+        out = self.relu(out)
+        out = self.dropout(out)
+        
+        return out
+
+
+class StreamingConv1dSub(nn.Module):
+    """Streaming version of Conv1d_sub."""
+    def __init__(self, input_dim, output_dim, k, dila, max_history_len=None):
+        super(StreamingConv1dSub, self).__init__()
+        self.input_dim, self.output_dim, self.k, self.dila = input_dim, output_dim, k, dila
+        self.streaming_conv = StreamingConv1d(input_dim, output_dim, k, dila, max_history_len)
+    
+    def reset_state(self):
+        self.streaming_conv.reset_state()
+    
+    def forward(self, x):
+        return self.streaming_conv(x)
+    
+    def streaming_forward(self, x):
+        return self.streaming_conv.streaming_forward(x)
     
 class MS_dilated_layer_514d(nn.Module):
     def __init__(self, k, dilas):
@@ -569,11 +657,7 @@ class StreamingGLU(nn.Module):
         self.dilation = dilation
         self.max_history_len = max_history_len
         
-        # Initialize padding
-        if self.is_causal:
-            self.pad = nn.ConstantPad1d((2*dilation, 0), value=0.)
-        else:
-            self.pad = nn.ConstantPad1d((2*dilation//2, 2*dilation//2), value=0.)
+        self.required_dilation_history = 2 * dilation
         
         # Convolution layers
         self.in_conv = nn.Sequential(                
@@ -584,24 +668,22 @@ class StreamingGLU(nn.Module):
         ) 
         self.query_conv = nn.Conv1d(64, 64, kernel_size=1, bias=False)
         self.key_conv = nn.Conv1d(64, 64, kernel_size=1, bias=False)
-        self.dilated_conv = nn.Sequential(
-            self.pad,
+        
+        self.dilated_conv_pre = nn.Sequential(
             nn.ReLU(64),
             nn.BatchNorm1d(64),
-            nn.Dropout(0.2),
-            nn.Conv1d(64, 64, kernel_size=3, dilation=dilation, bias=False)               
+            nn.Dropout(0.2)
         )
+        self.dilated_conv_main = nn.Conv1d(64, 64, kernel_size=3, dilation=dilation, bias=False)
+        
         self.out_conv = nn.Conv1d(64, 256, kernel_size=1, bias=False)
         
-        # State for streaming inference
         self.reset_state()
     
     def reset_state(self):
         """Reset the internal state for new utterance."""
         self.attention_state = StreamingSelfAttention(max_history_len=self.max_history_len)
         self.dilated_conv_buffer = None
-        self.in_conv_buffer = None
-        self.residual_buffer = None
     
     def streaming_forward(self, x):
         """
@@ -621,11 +703,25 @@ class StreamingGLU(nn.Module):
         key = self.key_conv(x)
         value = x
         
-        # Streaming self-attention
         x = self.attention_state.forward(query, key, value)
         
-        # Dilated convolution (causal, so it's streaming-friendly)
-        x = self.dilated_conv(x)
+        x_pre = self.dilated_conv_pre(x)
+        
+        batch_size, _, current_len = x_pre.shape
+        
+        if self.dilated_conv_buffer is None:
+            self.dilated_conv_buffer = torch.zeros(
+                batch_size, 64, self.required_dilation_history,
+                device=x_pre.device, dtype=x_pre.dtype
+            )
+        
+        full_input = torch.cat([self.dilated_conv_buffer, x_pre], dim=-1)
+        
+        self.dilated_conv_buffer = full_input[:, :, -self.required_dilation_history:].detach()
+        
+        conv_out = self.dilated_conv_main(full_input)
+        
+        x = conv_out[:, :, -current_len:]
         
         x = self.out_conv(x)
         x = x + resi
@@ -639,9 +735,13 @@ class StreamingGLU(nn.Module):
         query = self.query_conv(x)
         key = self.key_conv(x)
         value = x
-        # Use causal self-attention for training
         x = self_attention(query, key, value, mask=None, dropout=None, causal=True)
-        x = self.dilated_conv(x)
+        
+        pad = nn.ConstantPad1d((self.required_dilation_history, 0), value=0.)
+        x_pad = pad(x)
+        x_pre = self.dilated_conv_pre(x_pad)
+        x = self.dilated_conv_main(x_pre)
+        
         x = self.out_conv(x)
         x = x + resi            
         return x
@@ -711,34 +811,171 @@ class StreamingGTCN(nn.Module):
         return x
 
 
+class StreamingMSDilatedLayer514d(nn.Module):
+    """Streaming version of MS_dilated_layer_514d."""
+    def __init__(self, k, dilas, max_history_len=None):
+        super(StreamingMSDilatedLayer514d, self).__init__()
+        self.k, self.dilas = k, dilas
+        self.sub_groups = 8
+        self.max_history_len = max_history_len
+        
+        left_unit_list, right_unit_list = [], []
+        for i in range(self.sub_groups):
+            if i == 0:
+                left_unit_list.append(StreamingConv1dSub(64, 64, self.k, self.dilas, max_history_len))
+            elif (i==1) or (i==2) or (i==5) or (i==6):
+                left_unit_list.append(StreamingConv1dSub(128, 64, self.k, self.dilas, max_history_len))
+            elif (i==3) or (i==7):
+                left_unit_list.append(StreamingConv1dSub(129, 65, self.k, self.dilas, max_history_len))
+            else:
+                left_unit_list.append(StreamingConv1dSub(129, 64, self.k, self.dilas, max_history_len))
+        
+        for i in range(self.sub_groups):
+            if i == 7:
+                right_unit_list.append(StreamingConv1dSub(65, 65, self.k, self.dilas, max_history_len))
+            elif (i==6) or (i==2):
+                right_unit_list.append(StreamingConv1dSub(129, 64, self.k, self.dilas, max_history_len))
+            elif (i==5) or (i==4) or (i==1) or (i==0):
+                right_unit_list.append(StreamingConv1dSub(128, 64, self.k, self.dilas, max_history_len))
+            else:
+                right_unit_list.append(StreamingConv1dSub(129, 65, self.k, self.dilas, max_history_len))                
+        
+        self.left_unit_list, self.right_unit_list = nn.ModuleList(left_unit_list), nn.ModuleList(right_unit_list)
+    
+    def reset_state(self):
+        for unit in self.left_unit_list:
+            unit.reset_state()
+        for unit in self.right_unit_list:
+            unit.reset_state()
+    
+    def forward(self, inpt):
+        num_subs = 8
+        s0 = inpt[:,:64,:]
+        s1 = inpt[:,64:128,:]
+        s2 = inpt[:,128:192,:]
+        s3 = inpt[:,192:257,:]
+        s4 = inpt[:,257:321,:]
+        s5 = inpt[:,321:385,:]
+        s6 = inpt[:,385:449,:]
+        s7 = inpt[:,449:514,:]
+        
+        Left_subconv_out0 = self.left_unit_list[0](s0)
+        s = torch.cat((Left_subconv_out0, s1), 1)
+        Left_subconv_out1 = self.left_unit_list[1](s)
+        s = torch.cat((Left_subconv_out1, s2), 1)
+        Left_subconv_out2 = self.left_unit_list[2](s)
+        s = torch.cat((Left_subconv_out2, s3), 1)
+        Left_subconv_out3 = self.left_unit_list[3](s)
+        s = torch.cat((Left_subconv_out3, s4), 1)
+        Left_subconv_out4 = self.left_unit_list[4](s)
+        s = torch.cat((Left_subconv_out4, s5), 1)
+        Left_subconv_out5 = self.left_unit_list[5](s)
+        s = torch.cat((Left_subconv_out5, s6), 1)
+        Left_subconv_out6 = self.left_unit_list[6](s)
+        s = torch.cat((Left_subconv_out6, s7), 1)
+        Left_subconv_out7 = self.left_unit_list[7](s)
+        
+        Right_subconv_out7 = self.right_unit_list[7](s7)
+        s = torch.cat((s6,Right_subconv_out7),1)
+        Right_subconv_out6 = self.right_unit_list[6](s)
+        s = torch.cat((s5,Right_subconv_out6),1)
+        Right_subconv_out5 = self.right_unit_list[5](s)
+        s = torch.cat((s4,Right_subconv_out5),1)
+        Right_subconv_out4 = self.right_unit_list[4](s)
+        s = torch.cat((s3,Right_subconv_out4),1)
+        Right_subconv_out3 = self.right_unit_list[3](s)
+        s = torch.cat((s2,Right_subconv_out3),1)
+        Right_subconv_out2 = self.right_unit_list[2](s)
+        s = torch.cat((s1,Right_subconv_out2),1)
+        Right_subconv_out1 = self.right_unit_list[1](s)
+        s = torch.cat((s0,Right_subconv_out1),1)
+        Right_subconv_out0 = self.right_unit_list[0](s)
+        
+        subconv_out0 = Left_subconv_out0 + Right_subconv_out0
+        subconv_out1 = Left_subconv_out1 + Right_subconv_out1
+        subconv_out2 = Left_subconv_out2 + Right_subconv_out2
+        subconv_out3 = Left_subconv_out3 + Right_subconv_out3
+        subconv_out4 = Left_subconv_out4 + Right_subconv_out4
+        subconv_out5 = Left_subconv_out5 + Right_subconv_out5
+        subconv_out6 = Left_subconv_out6 + Right_subconv_out6
+        subconv_out7 = Left_subconv_out7 + Right_subconv_out7
+        
+        subconv_out = torch.cat((subconv_out0,subconv_out1,subconv_out2,subconv_out3,subconv_out4,subconv_out5,subconv_out6,subconv_out7),1) 
+        return subconv_out
+    
+    def streaming_forward(self, inpt):
+        num_subs = 8
+        s0 = inpt[:,:64,:]
+        s1 = inpt[:,64:128,:]
+        s2 = inpt[:,128:192,:]
+        s3 = inpt[:,192:257,:]
+        s4 = inpt[:,257:321,:]
+        s5 = inpt[:,321:385,:]
+        s6 = inpt[:,385:449,:]
+        s7 = inpt[:,449:514,:]
+        
+        Left_subconv_out0 = self.left_unit_list[0].streaming_forward(s0)
+        s = torch.cat((Left_subconv_out0, s1), 1)
+        Left_subconv_out1 = self.left_unit_list[1].streaming_forward(s)
+        s = torch.cat((Left_subconv_out1, s2), 1)
+        Left_subconv_out2 = self.left_unit_list[2].streaming_forward(s)
+        s = torch.cat((Left_subconv_out2, s3), 1)
+        Left_subconv_out3 = self.left_unit_list[3].streaming_forward(s)
+        s = torch.cat((Left_subconv_out3, s4), 1)
+        Left_subconv_out4 = self.left_unit_list[4].streaming_forward(s)
+        s = torch.cat((Left_subconv_out4, s5), 1)
+        Left_subconv_out5 = self.left_unit_list[5].streaming_forward(s)
+        s = torch.cat((Left_subconv_out5, s6), 1)
+        Left_subconv_out6 = self.left_unit_list[6].streaming_forward(s)
+        s = torch.cat((Left_subconv_out6, s7), 1)
+        Left_subconv_out7 = self.left_unit_list[7].streaming_forward(s)
+        
+        Right_subconv_out7 = self.right_unit_list[7].streaming_forward(s7)
+        s = torch.cat((s6,Right_subconv_out7),1)
+        Right_subconv_out6 = self.right_unit_list[6].streaming_forward(s)
+        s = torch.cat((s5,Right_subconv_out6),1)
+        Right_subconv_out5 = self.right_unit_list[5].streaming_forward(s)
+        s = torch.cat((s4,Right_subconv_out5),1)
+        Right_subconv_out4 = self.right_unit_list[4].streaming_forward(s)
+        s = torch.cat((s3,Right_subconv_out4),1)
+        Right_subconv_out3 = self.right_unit_list[3].streaming_forward(s)
+        s = torch.cat((s2,Right_subconv_out3),1)
+        Right_subconv_out2 = self.right_unit_list[2].streaming_forward(s)
+        s = torch.cat((s1,Right_subconv_out2),1)
+        Right_subconv_out1 = self.right_unit_list[1].streaming_forward(s)
+        s = torch.cat((s0,Right_subconv_out1),1)
+        Right_subconv_out0 = self.right_unit_list[0].streaming_forward(s)
+        
+        subconv_out0 = Left_subconv_out0 + Right_subconv_out0
+        subconv_out1 = Left_subconv_out1 + Right_subconv_out1
+        subconv_out2 = Left_subconv_out2 + Right_subconv_out2
+        subconv_out3 = Left_subconv_out3 + Right_subconv_out3
+        subconv_out4 = Left_subconv_out4 + Right_subconv_out4
+        subconv_out5 = Left_subconv_out5 + Right_subconv_out5
+        subconv_out6 = Left_subconv_out6 + Right_subconv_out6
+        subconv_out7 = Left_subconv_out7 + Right_subconv_out7
+        
+        subconv_out = torch.cat((subconv_out0,subconv_out1,subconv_out2,subconv_out3,subconv_out4,subconv_out5,subconv_out6,subconv_out7),1) 
+        return subconv_out
+
+
 class StreamingMSResBlock(nn.Module):
     """Streaming version of MS_ResBlock."""
-    def __init__(self, k, dilation):
+    def __init__(self, k, dilation, max_history_len=None):
         super(StreamingMSResBlock, self).__init__()
         self.k = k
         self.dilation = dilation
         self.conv1d_1 = Conv_layer_1d(1028, 257)
         self.conv1d_2 = Conv_layer_1d(514, 1028)
-        self.ms_conv1d = MS_dilated_layer_514d(self.k, self.dilation)
-        
-        # Buffer for residual connection
-        self.prev_x_buffer = None
+        self.ms_conv1d = StreamingMSDilatedLayer514d(self.k, self.dilation, max_history_len)
     
     def reset_state(self):
-        """Reset the buffer."""
-        self.prev_x_buffer = None
+        self.ms_conv1d.reset_state()
     
     def streaming_forward(self, prev_x, forw_x):
-        """
-        Streaming forward pass.
-        
-        Args:
-            prev_x: Previous layer output [batch, 1028, current_len]
-            forw_x: Original magnitude feature [batch, 257, current_len]
-        """
         x = self.conv1d_1(prev_x)
         x = torch.cat((forw_x, x), 1)
-        x = self.ms_conv1d(x)
+        x = self.ms_conv1d.streaming_forward(x)
         x = self.conv1d_2(x)
         x = x + prev_x
         return x
@@ -764,49 +1001,55 @@ class StreamingComplexMTASS(nn.Module):
         
         self.max_history_len = max_history_len
         
-        # Stage 1: Multi-Task Separation Module
         self.conv1d_1 = Conv_layer_1d(257, 1028)
         self.conv1d_2 = Conv_layer_1d(1028, 1028)
         self.conv1d_3 = nn.Conv1d(1028, 514, kernel_size=1)
         self.conv1d_4 = nn.Conv1d(1028, 514, kernel_size=1)
         self.conv1d_5 = nn.Conv1d(1028, 514, kernel_size=1)
         
-        # Multi-scale resblocks (these are already causal/streaming-friendly)
-        self.ms_resblock_1 = MS_ResBlock(3,1)
-        self.ms_resblock_2 = MS_ResBlock(3,3)
-        self.ms_resblock_3 = MS_ResBlock(3,5)
-        self.ms_resblock_4 = MS_ResBlock(3,7)
-        self.ms_resblock_5 = MS_ResBlock(3,11)
-        self.ms_resblock_6 = MS_ResBlock(3,1)
-        self.ms_resblock_7 = MS_ResBlock(3,3)
-        self.ms_resblock_8 = MS_ResBlock(3,5)
-        self.ms_resblock_9 = MS_ResBlock(3,7)
-        self.ms_resblock_10 = MS_ResBlock(3,11)
-        self.ms_resblock_11 = MS_ResBlock(3,1)
-        self.ms_resblock_12 = MS_ResBlock(3,3)
-        self.ms_resblock_13 = MS_ResBlock(3,5)
-        self.ms_resblock_14 = MS_ResBlock(3,7)
-        self.ms_resblock_15 = MS_ResBlock(3,11)
+        self.ms_resblock_1 = StreamingMSResBlock(3, 1, max_history_len)
+        self.ms_resblock_2 = StreamingMSResBlock(3, 3, max_history_len)
+        self.ms_resblock_3 = StreamingMSResBlock(3, 5, max_history_len)
+        self.ms_resblock_4 = StreamingMSResBlock(3, 7, max_history_len)
+        self.ms_resblock_5 = StreamingMSResBlock(3, 11, max_history_len)
+        self.ms_resblock_6 = StreamingMSResBlock(3, 1, max_history_len)
+        self.ms_resblock_7 = StreamingMSResBlock(3, 3, max_history_len)
+        self.ms_resblock_8 = StreamingMSResBlock(3, 5, max_history_len)
+        self.ms_resblock_9 = StreamingMSResBlock(3, 7, max_history_len)
+        self.ms_resblock_10 = StreamingMSResBlock(3, 11, max_history_len)
+        self.ms_resblock_11 = StreamingMSResBlock(3, 1, max_history_len)
+        self.ms_resblock_12 = StreamingMSResBlock(3, 3, max_history_len)
+        self.ms_resblock_13 = StreamingMSResBlock(3, 5, max_history_len)
+        self.ms_resblock_14 = StreamingMSResBlock(3, 7, max_history_len)
+        self.ms_resblock_15 = StreamingMSResBlock(3, 11, max_history_len)
         
-        # Stage 2: Residual Repair Module (Streaming versions)
         self.speech_res_block = StreamingGTCN(5, 8, max_history_len)
         self.music_res_block = StreamingGTCN(5, 8, max_history_len)
         self.others_res_block = StreamingGTCN(5, 8, max_history_len)
         
-        # Buffers for intermediate results
         self.reset_state()
     
     def reset_state(self):
         """Reset all internal states for new utterance."""
+        self.ms_resblock_1.reset_state()
+        self.ms_resblock_2.reset_state()
+        self.ms_resblock_3.reset_state()
+        self.ms_resblock_4.reset_state()
+        self.ms_resblock_5.reset_state()
+        self.ms_resblock_6.reset_state()
+        self.ms_resblock_7.reset_state()
+        self.ms_resblock_8.reset_state()
+        self.ms_resblock_9.reset_state()
+        self.ms_resblock_10.reset_state()
+        self.ms_resblock_11.reset_state()
+        self.ms_resblock_12.reset_state()
+        self.ms_resblock_13.reset_state()
+        self.ms_resblock_14.reset_state()
+        self.ms_resblock_15.reset_state()
+        
         self.speech_res_block.reset_state()
         self.music_res_block.reset_state()
         self.others_res_block.reset_state()
-        
-        # Clear intermediate buffers
-        self.x_mag_buffer = None
-        self.y1_RI_buffer = None
-        self.y2_RI_buffer = None
-        self.y3_RI_buffer = None
     
     def streaming_forward(self, X1):
         """
@@ -819,28 +1062,27 @@ class StreamingComplexMTASS(nn.Module):
         Returns:
             y1_RI_out, y2_RI_out, y3_RI_out: Separated speech, music, others
         """
-        # Stage 1: Multi-Task Separation Module
         x_real = torch.unsqueeze(X1[:,:257,:], 1)
         x_imag = torch.unsqueeze(X1[:,257:,:], 1)
         x_ri = torch.cat((x_real, x_imag), 1)
         x_mag = torch.norm(x_ri, dim=1)
         
         x = self.conv1d_1(x_mag)
-        x = self.ms_resblock_1(x, x_mag)
-        x = self.ms_resblock_2(x, x_mag)
-        x = self.ms_resblock_3(x, x_mag)
-        x = self.ms_resblock_4(x, x_mag)
-        x = self.ms_resblock_5(x, x_mag)
-        x = self.ms_resblock_6(x, x_mag)
-        x = self.ms_resblock_7(x, x_mag)
-        x = self.ms_resblock_8(x, x_mag)
-        x = self.ms_resblock_9(x, x_mag)
-        x = self.ms_resblock_10(x, x_mag)
-        x = self.ms_resblock_11(x, x_mag)
-        x = self.ms_resblock_12(x, x_mag)
-        x = self.ms_resblock_13(x, x_mag)
-        x = self.ms_resblock_14(x, x_mag)
-        x = self.ms_resblock_15(x, x_mag)
+        x = self.ms_resblock_1.streaming_forward(x, x_mag)
+        x = self.ms_resblock_2.streaming_forward(x, x_mag)
+        x = self.ms_resblock_3.streaming_forward(x, x_mag)
+        x = self.ms_resblock_4.streaming_forward(x, x_mag)
+        x = self.ms_resblock_5.streaming_forward(x, x_mag)
+        x = self.ms_resblock_6.streaming_forward(x, x_mag)
+        x = self.ms_resblock_7.streaming_forward(x, x_mag)
+        x = self.ms_resblock_8.streaming_forward(x, x_mag)
+        x = self.ms_resblock_9.streaming_forward(x, x_mag)
+        x = self.ms_resblock_10.streaming_forward(x, x_mag)
+        x = self.ms_resblock_11.streaming_forward(x, x_mag)
+        x = self.ms_resblock_12.streaming_forward(x, x_mag)
+        x = self.ms_resblock_13.streaming_forward(x, x_mag)
+        x = self.ms_resblock_14.streaming_forward(x, x_mag)
+        x = self.ms_resblock_15.streaming_forward(x, x_mag)
         x = self.conv1d_2(x)
         
         y1_mask = self.conv1d_3(x)
@@ -851,7 +1093,6 @@ class StreamingComplexMTASS(nn.Module):
         y2_RI = y2_mask * X1
         y3_RI = y3_mask * X1
         
-        # Stage 2: Residual Repair Module (Streaming)
         y1_Res_in = X1 - y1_RI
         y2_Res_in = X1 - y2_RI
         y3_Res_in = X1 - y3_RI
@@ -868,7 +1109,6 @@ class StreamingComplexMTASS(nn.Module):
     
     def forward(self, X1):
         """Non-streaming forward pass (for training)."""
-        # Stage 1: Multi-Task Separation Module
         x_real = torch.unsqueeze(X1[:,:257,:], 1)
         x_imag = torch.unsqueeze(X1[:,257:,:], 1)
         x_ri = torch.cat((x_real, x_imag), 1)
@@ -900,7 +1140,6 @@ class StreamingComplexMTASS(nn.Module):
         y2_RI = y2_mask * X1
         y3_RI = y3_mask * X1
         
-        # Stage 2: Residual Repair Module
         y1_Res_in = X1 - y1_RI
         y2_Res_in = X1 - y2_RI
         y3_Res_in = X1 - y3_RI
