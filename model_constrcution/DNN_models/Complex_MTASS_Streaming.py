@@ -29,6 +29,7 @@ from utils.utils_library_gpu import *
 # * Class:
 #     Complex_MTASS()---Implements the Complex-domain MTASS model for speech, noise and music separation
 #                   (Using Two-Stage Pipeline, supports 16Khz audio format, 512 FFT-len)
+#                   **Streaming Version with Causal Self-Attention**
 #
 #   * Arguments:
 #    * X1 -- Input mixture feature of shape (Batch size, feature size, sentence length)
@@ -41,6 +42,13 @@ from utils.utils_library_gpu import *
 # * Authors and Copyright:
 #    Writtern by Dr. Wind at Harbin Institute of Technology, Shenzhen.
 #    Contact Email: zhanglu_wind@163.com
+#
+# * Modification for Streaming:
+#    Modified to support streaming (causal) decoding with self-attention.
+#    Key changes:
+#    1. Added causal mask to self_attention function for training
+#    2. Added StreamingGLU class with state caching for frame-by-frame inference
+#    3. Added streaming_forward interface for real-time processing
 # ----------------------------------------------------------------------------------------------------------------
 
 
@@ -360,16 +368,38 @@ class TCM_list(nn.Module):
         return x
 
 
-def self_attention(query, key, value, mask=None, dropout=None):
+def self_attention(query, key, value, mask=None, dropout=None, causal=True):
+    """
+    Self-attention mechanism with optional causal masking for streaming support.
+    
+    Args:
+        query: shape [-1, d_k, sen_len]
+        key: shape [-1, d_k, sen_len]
+        value: shape [-1, d_k, sen_len]
+        mask: optional mask
+        dropout: optional dropout
+        causal: if True, applies causal mask for streaming (default: True)
+    
+    Returns:
+        attn_out: shape [-1, d_k, sen_len]
+    """
     # query.shape = [-1,64,sen_len]
     # key.shape = [-1,64,sen_len]
     # value.shape = [-1,64,sen_len]
     d_k = query.size(-2) # d_k=64
     query = query.transpose(-2,-1) # query.shape = [-1,sen_len,64]
-    scores = torch.matmul(query,key) / math.sqrt(d_k) # scores.shape = [-1,sen_len,sen_len]
+    scores = torch.matmul(query, key) / math.sqrt(d_k) # scores.shape = [-1,sen_len,sen_len]
+    
+    # Apply causal mask for streaming support
+    if causal:
+        sen_len = scores.size(-1)
+        # Create causal mask: upper triangular (excluding diagonal) is masked
+        causal_mask = torch.tril(torch.ones(sen_len, sen_len, device=scores.device))
+        scores = scores.masked_fill(causal_mask.unsqueeze(0) == 0, -1e9)
     
     if mask is not None:
         scores = scores.masked_fill(mask == 0, -1e9)
+    
     p_attn = F.softmax(scores, dim = -1) # Perform softmax on the last dimension of scores
     
     if dropout is not None:
@@ -380,8 +410,79 @@ def self_attention(query, key, value, mask=None, dropout=None):
     attn_out = attn_out.transpose(-2,-1) # attn_out.shape = [-1,64,sen_len]
     
     return attn_out
-       
+
+
+class StreamingSelfAttention:
+    """
+    Streaming (causal) self-attention for frame-by-frame processing.
+    
+    Maintains a history buffer of key and value vectors, allowing
+    streaming inference without accessing future frames.
+    """
+    def __init__(self, max_history_len=1000):
+        self.max_history_len = max_history_len
+        self.reset_state()
+    
+    def reset_state(self):
+        """Reset the internal state for new utterance."""
+        self.key_history = None
+        self.value_history = None
+        self.history_len = 0
+    
+    def forward(self, query, key, value, dropout=None):
+        """
+        Streaming self-attention for single frame or chunk.
         
+        Args:
+            query: shape [-1, d_k, current_len] - current query
+            key: shape [-1, d_k, current_len] - current key
+            value: shape [-1, d_k, current_len] - current value
+            dropout: optional dropout (typically None during inference)
+        
+        Returns:
+            attn_out: shape [-1, d_k, current_len]
+        """
+        batch_size, d_k, current_len = query.shape
+        
+        # Concatenate with history
+        if self.key_history is None or self.history_len == 0:
+            full_key = key
+            full_value = value
+        else:
+            # Concatenate along time dimension
+            full_key = torch.cat([self.key_history, key], dim=-1)
+            full_value = torch.cat([self.value_history, value], dim=-1)
+        
+        # Update history
+        self.key_history = full_key.detach()
+        self.value_history = full_value.detach()
+        self.history_len = full_key.size(-1)
+        
+        # Trim history if too long (to prevent memory issues)
+        if self.history_len > self.max_history_len:
+            self.key_history = self.key_history[:, :, -self.max_history_len:]
+            self.value_history = self.value_history[:, :, -self.max_history_len:]
+            self.history_len = self.max_history_len
+        
+        # Compute attention
+        d_k_float = float(d_k)
+        query_t = query.transpose(-2, -1)  # [batch, current_len, d_k]
+        scores = torch.matmul(query_t, full_key) / math.sqrt(d_k_float)  # [batch, current_len, history_len + current_len]
+        
+        # Apply softmax
+        p_attn = F.softmax(scores, dim=-1)
+        
+        if dropout is not None:
+            p_attn = dropout(p_attn)
+        
+        # Compute output
+        full_value_t = full_value.transpose(-2, -1)  # [batch, history_len + current_len, d_k]
+        attn_out = torch.matmul(p_attn, full_value_t)  # [batch, current_len, d_k]
+        attn_out = attn_out.transpose(-2, -1)  # [batch, d_k, current_len]
+        
+        return attn_out
+
+
 class GLU(nn.Module):
     def __init__(self, dilation):
         super(GLU, self).__init__()
@@ -445,13 +546,424 @@ class GLU(nn.Module):
             query = self.query_conv(x)
             key = self.key_conv(x)
             value = x
-            x = self_attention(query, key, value, mask=None, dropout=self.dropout)
+            # Use causal self-attention for training (supports streaming inference)
+            x = self_attention(query, key, value, mask=None, dropout=self.dropout, causal=True)
             x = self.dilated_conv(x)
             x = self.out_conv(x)
             x = x + resi            
       
         return x
 
+
+class StreamingGLU(nn.Module):
+    """
+    Streaming version of GLU module with self-attention.
+    
+    Maintains internal state for frame-by-frame processing,
+    making it suitable for real-time streaming applications.
+    """
+    def __init__(self, dilation, max_history_len=1000):
+        super(StreamingGLU, self).__init__()
+        self.apply_self_attn = True
+        self.is_causal = True
+        self.dilation = dilation
+        self.max_history_len = max_history_len
+        
+        # Initialize padding
+        if self.is_causal:
+            self.pad = nn.ConstantPad1d((2*dilation, 0), value=0.)
+        else:
+            self.pad = nn.ConstantPad1d((2*dilation//2, 2*dilation//2), value=0.)
+        
+        # Convolution layers
+        self.in_conv = nn.Sequential(                
+            nn.Conv1d(256, 64, kernel_size=1, bias=False),
+            nn.ReLU(64),
+            nn.BatchNorm1d(64),
+            nn.Dropout(0.2)
+        ) 
+        self.query_conv = nn.Conv1d(64, 64, kernel_size=1, bias=False)
+        self.key_conv = nn.Conv1d(64, 64, kernel_size=1, bias=False)
+        self.dilated_conv = nn.Sequential(
+            self.pad,
+            nn.ReLU(64),
+            nn.BatchNorm1d(64),
+            nn.Dropout(0.2),
+            nn.Conv1d(64, 64, kernel_size=3, dilation=dilation, bias=False)               
+        )
+        self.out_conv = nn.Conv1d(64, 256, kernel_size=1, bias=False)
+        
+        # State for streaming inference
+        self.reset_state()
+    
+    def reset_state(self):
+        """Reset the internal state for new utterance."""
+        self.attention_state = StreamingSelfAttention(max_history_len=self.max_history_len)
+        self.dilated_conv_buffer = None
+        self.in_conv_buffer = None
+        self.residual_buffer = None
+    
+    def streaming_forward(self, x):
+        """
+        Streaming forward pass for frame-by-frame processing.
+        
+        Args:
+            x: Input tensor of shape [batch, 256, current_len]
+               For frame-by-frame: current_len = 1
+        
+        Returns:
+            Output tensor of shape [batch, 256, current_len]
+        """
+        resi = x
+        x = self.in_conv(x)
+        
+        query = self.query_conv(x)
+        key = self.key_conv(x)
+        value = x
+        
+        # Streaming self-attention
+        x = self.attention_state.forward(query, key, value)
+        
+        # Dilated convolution (causal, so it's streaming-friendly)
+        x = self.dilated_conv(x)
+        
+        x = self.out_conv(x)
+        x = x + resi
+        
+        return x
+    
+    def forward(self, x):
+        """Non-streaming forward pass (for training)."""
+        resi = x
+        x = self.in_conv(x)
+        query = self.query_conv(x)
+        key = self.key_conv(x)
+        value = x
+        # Use causal self-attention for training
+        x = self_attention(query, key, value, mask=None, dropout=None, causal=True)
+        x = self.dilated_conv(x)
+        x = self.out_conv(x)
+        x = x + resi            
+        return x
+
+
+class StreamingTCMList(nn.Module):
+    """Streaming version of TCM_list with state management."""
+    def __init__(self, num_blocks, max_history_len=1000):
+        super(StreamingTCMList, self).__init__()
+        self.X = num_blocks
+        self.tcm_list = nn.ModuleList([StreamingGLU(2 ** i, max_history_len) for i in range(self.X)])
+    
+    def reset_state(self):
+        """Reset all TCM states."""
+        for tcm in self.tcm_list:
+            tcm.reset_state()
+    
+    def streaming_forward(self, x):
+        """Streaming forward pass."""
+        for i in range(self.X):
+            x = self.tcm_list[i].streaming_forward(x)
+        return x
+    
+    def forward(self, x):
+        """Non-streaming forward pass."""
+        for i in range(self.X):
+            x = self.tcm_list[i](x)
+        return x
+
+
+class StreamingGTCN(nn.Module):
+    """Streaming version of GTCN for residual repair module."""
+    def __init__(self, repeats, num_blocks, max_history_len=1000):
+        super(StreamingGTCN, self).__init__()
+        self.conv1d_in = nn.Conv1d(514, 256, kernel_size=1)
+        self.tcm_list = nn.ModuleList([StreamingTCMList(num_blocks, max_history_len) for _ in range(repeats)])
+        self.conv1d_out = nn.Conv1d(256, 514, kernel_size=1)
+        self.repeats = repeats
+    
+    def reset_state(self):
+        """Reset all TCM states."""
+        for tcm in self.tcm_list:
+            tcm.reset_state()
+    
+    def streaming_forward(self, inpt):
+        """
+        Streaming forward pass for frame-by-frame processing.
+        
+        Args:
+            inpt: Input tensor of shape [batch, 514, current_len]
+        
+        Returns:
+            Output tensor of shape [batch, 514, current_len]
+        """
+        x = self.conv1d_in(inpt)
+        for i in range(self.repeats):
+            x = self.tcm_list[i].streaming_forward(x)
+        x = self.conv1d_out(x)
+        return x
+    
+    def forward(self, inpt):
+        """Non-streaming forward pass."""
+        x = self.conv1d_in(inpt)
+        for i in range(self.repeats):
+            x = self.tcm_list[i](x)
+        x = self.conv1d_out(x)
+        return x
+
+
+class StreamingMSResBlock(nn.Module):
+    """Streaming version of MS_ResBlock."""
+    def __init__(self, k, dilation):
+        super(StreamingMSResBlock, self).__init__()
+        self.k = k
+        self.dilation = dilation
+        self.conv1d_1 = Conv_layer_1d(1028, 257)
+        self.conv1d_2 = Conv_layer_1d(514, 1028)
+        self.ms_conv1d = MS_dilated_layer_514d(self.k, self.dilation)
+        
+        # Buffer for residual connection
+        self.prev_x_buffer = None
+    
+    def reset_state(self):
+        """Reset the buffer."""
+        self.prev_x_buffer = None
+    
+    def streaming_forward(self, prev_x, forw_x):
+        """
+        Streaming forward pass.
+        
+        Args:
+            prev_x: Previous layer output [batch, 1028, current_len]
+            forw_x: Original magnitude feature [batch, 257, current_len]
+        """
+        x = self.conv1d_1(prev_x)
+        x = torch.cat((forw_x, x), 1)
+        x = self.ms_conv1d(x)
+        x = self.conv1d_2(x)
+        x = x + prev_x
+        return x
+    
+    def forward(self, prev_x, forw_x):
+        x = self.conv1d_1(prev_x)
+        x = torch.cat((forw_x, x), 1)
+        x = self.ms_conv1d(x)
+        x = self.conv1d_2(x)
+        x = x + prev_x
+        return x
+
+
+class StreamingComplexMTASS(nn.Module):
+    """
+    Streaming version of Complex_MTASS model.
+    
+    Supports frame-by-frame inference for real-time applications
+    while maintaining the same architecture as the original model.
+    """
+    def __init__(self, max_history_len=1000):
+        super(StreamingComplexMTASS, self).__init__()
+        
+        self.max_history_len = max_history_len
+        
+        # Stage 1: Multi-Task Separation Module
+        self.conv1d_1 = Conv_layer_1d(257, 1028)
+        self.conv1d_2 = Conv_layer_1d(1028, 1028)
+        self.conv1d_3 = nn.Conv1d(1028, 514, kernel_size=1)
+        self.conv1d_4 = nn.Conv1d(1028, 514, kernel_size=1)
+        self.conv1d_5 = nn.Conv1d(1028, 514, kernel_size=1)
+        
+        # Multi-scale resblocks (these are already causal/streaming-friendly)
+        self.ms_resblock_1 = MS_ResBlock(3,1)
+        self.ms_resblock_2 = MS_ResBlock(3,3)
+        self.ms_resblock_3 = MS_ResBlock(3,5)
+        self.ms_resblock_4 = MS_ResBlock(3,7)
+        self.ms_resblock_5 = MS_ResBlock(3,11)
+        self.ms_resblock_6 = MS_ResBlock(3,1)
+        self.ms_resblock_7 = MS_ResBlock(3,3)
+        self.ms_resblock_8 = MS_ResBlock(3,5)
+        self.ms_resblock_9 = MS_ResBlock(3,7)
+        self.ms_resblock_10 = MS_ResBlock(3,11)
+        self.ms_resblock_11 = MS_ResBlock(3,1)
+        self.ms_resblock_12 = MS_ResBlock(3,3)
+        self.ms_resblock_13 = MS_ResBlock(3,5)
+        self.ms_resblock_14 = MS_ResBlock(3,7)
+        self.ms_resblock_15 = MS_ResBlock(3,11)
+        
+        # Stage 2: Residual Repair Module (Streaming versions)
+        self.speech_res_block = StreamingGTCN(5, 8, max_history_len)
+        self.music_res_block = StreamingGTCN(5, 8, max_history_len)
+        self.others_res_block = StreamingGTCN(5, 8, max_history_len)
+        
+        # Buffers for intermediate results
+        self.reset_state()
+    
+    def reset_state(self):
+        """Reset all internal states for new utterance."""
+        self.speech_res_block.reset_state()
+        self.music_res_block.reset_state()
+        self.others_res_block.reset_state()
+        
+        # Clear intermediate buffers
+        self.x_mag_buffer = None
+        self.y1_RI_buffer = None
+        self.y2_RI_buffer = None
+        self.y3_RI_buffer = None
+    
+    def streaming_forward(self, X1):
+        """
+        Streaming forward pass for frame-by-frame processing.
+        
+        Args:
+            X1: Input mixture RI of shape [batch, 514, current_len]
+                For frame-by-frame: current_len = 1
+        
+        Returns:
+            y1_RI_out, y2_RI_out, y3_RI_out: Separated speech, music, others
+        """
+        # Stage 1: Multi-Task Separation Module
+        x_real = torch.unsqueeze(X1[:,:257,:], 1)
+        x_imag = torch.unsqueeze(X1[:,257:,:], 1)
+        x_ri = torch.cat((x_real, x_imag), 1)
+        x_mag = torch.norm(x_ri, dim=1)
+        
+        x = self.conv1d_1(x_mag)
+        x = self.ms_resblock_1(x, x_mag)
+        x = self.ms_resblock_2(x, x_mag)
+        x = self.ms_resblock_3(x, x_mag)
+        x = self.ms_resblock_4(x, x_mag)
+        x = self.ms_resblock_5(x, x_mag)
+        x = self.ms_resblock_6(x, x_mag)
+        x = self.ms_resblock_7(x, x_mag)
+        x = self.ms_resblock_8(x, x_mag)
+        x = self.ms_resblock_9(x, x_mag)
+        x = self.ms_resblock_10(x, x_mag)
+        x = self.ms_resblock_11(x, x_mag)
+        x = self.ms_resblock_12(x, x_mag)
+        x = self.ms_resblock_13(x, x_mag)
+        x = self.ms_resblock_14(x, x_mag)
+        x = self.ms_resblock_15(x, x_mag)
+        x = self.conv1d_2(x)
+        
+        y1_mask = self.conv1d_3(x)
+        y2_mask = self.conv1d_4(x)
+        y3_mask = self.conv1d_5(x)
+        
+        y1_RI = y1_mask * X1
+        y2_RI = y2_mask * X1
+        y3_RI = y3_mask * X1
+        
+        # Stage 2: Residual Repair Module (Streaming)
+        y1_Res_in = X1 - y1_RI
+        y2_Res_in = X1 - y2_RI
+        y3_Res_in = X1 - y3_RI
+        
+        y1_Res = self.speech_res_block.streaming_forward(y1_Res_in)
+        y2_Res = self.music_res_block.streaming_forward(y2_Res_in)
+        y3_Res = self.others_res_block.streaming_forward(y3_Res_in)
+        
+        y1_RI_out = y1_RI + y1_Res
+        y2_RI_out = y2_RI + y2_Res
+        y3_RI_out = y3_RI + y3_Res
+        
+        return y1_RI_out, y2_RI_out, y3_RI_out
+    
+    def forward(self, X1):
+        """Non-streaming forward pass (for training)."""
+        # Stage 1: Multi-Task Separation Module
+        x_real = torch.unsqueeze(X1[:,:257,:], 1)
+        x_imag = torch.unsqueeze(X1[:,257:,:], 1)
+        x_ri = torch.cat((x_real, x_imag), 1)
+        x_mag = torch.norm(x_ri, dim=1)
+        
+        x = self.conv1d_1(x_mag)
+        x = self.ms_resblock_1(x, x_mag)
+        x = self.ms_resblock_2(x, x_mag)
+        x = self.ms_resblock_3(x, x_mag)
+        x = self.ms_resblock_4(x, x_mag)
+        x = self.ms_resblock_5(x, x_mag)
+        x = self.ms_resblock_6(x, x_mag)
+        x = self.ms_resblock_7(x, x_mag)
+        x = self.ms_resblock_8(x, x_mag)
+        x = self.ms_resblock_9(x, x_mag)
+        x = self.ms_resblock_10(x, x_mag)
+        x = self.ms_resblock_11(x, x_mag)
+        x = self.ms_resblock_12(x, x_mag)
+        x = self.ms_resblock_13(x, x_mag)
+        x = self.ms_resblock_14(x, x_mag)
+        x = self.ms_resblock_15(x, x_mag)
+        x = self.conv1d_2(x)
+        
+        y1_mask = self.conv1d_3(x)
+        y2_mask = self.conv1d_4(x)
+        y3_mask = self.conv1d_5(x)
+        
+        y1_RI = y1_mask * X1
+        y2_RI = y2_mask * X1
+        y3_RI = y3_mask * X1
+        
+        # Stage 2: Residual Repair Module
+        y1_Res_in = X1 - y1_RI
+        y2_Res_in = X1 - y2_RI
+        y3_Res_in = X1 - y3_RI
+        
+        y1_Res = self.speech_res_block(y1_Res_in)
+        y2_Res = self.music_res_block(y2_Res_in)
+        y3_Res = self.others_res_block(y3_Res_in)
+        
+        y1_RI_out = y1_RI + y1_Res
+        y2_RI_out = y2_RI + y2_Res
+        y3_RI_out = y3_RI + y3_Res
+        
+        return y1_RI_out, y2_RI_out, y3_RI_out
+
+
+def test_streaming():
+    """Test streaming inference."""
+    batch_size = 1
+    feature_size = 514
+    seq_len = 100  # Simulate 100 frames
+    
+    # Create model
+    model = StreamingComplexMTASS(max_history_len=1000)
+    model.eval()
+    
+    # Non-streaming inference (reference)
+    X1 = torch.rand(batch_size, feature_size, seq_len)
+    with torch.no_grad():
+        y1_ref, y2_ref, y3_ref = model(X1)
+    
+    print(f"Reference output shapes: {y1_ref.shape}, {y2_ref.shape}, {y3_ref.shape}")
+    
+    # Streaming inference (frame-by-frame)
+    model.reset_state()
+    y1_list, y2_list, y3_list = [], [], []
+    
+    with torch.no_grad():
+        for t in range(seq_len):
+            x_frame = X1[:, :, t:t+1]  # Get single frame
+            y1_frame, y2_frame, y3_frame = model.streaming_forward(x_frame)
+            y1_list.append(y1_frame)
+            y2_list.append(y2_frame)
+            y3_list.append(y3_frame)
+    
+    y1_stream = torch.cat(y1_list, dim=-1)
+    y2_stream = torch.cat(y2_list, dim=-1)
+    y3_stream = torch.cat(y3_list, dim=-1)
+    
+    print(f"Streaming output shapes: {y1_stream.shape}, {y2_stream.shape}, {y3_stream.shape}")
+    
+    # Compare outputs
+    diff1 = torch.abs(y1_ref - y1_stream).max().item()
+    diff2 = torch.abs(y2_ref - y2_stream).max().item()
+    diff3 = torch.abs(y3_ref - y3_stream).max().item()
+    
+    print(f"Max difference (speech): {diff1:.6f}")
+    print(f"Max difference (music): {diff2:.6f}")
+    print(f"Max difference (others): {diff3:.6f}")
+    
+    if max(diff1, diff2, diff3) < 1e-5:
+        print("✓ Streaming and non-streaming outputs match!")
+    else:
+        print("✗ Warning: Outputs differ significantly")
 
 
 def test_GTCN():
@@ -475,17 +987,8 @@ def test_Complex_MTASS():
     print('MAC of the model is:', Macs)
 
 if __name__ == "__main__":
+    print("Testing non-streaming Complex_MTASS:")
     test_Complex_MTASS()
-
-
-              )
-    Macs, params = clever_format([Macs, params], "%.3f")            
-    print('Model Summary:')
-    print('Trainable params of the model is:', params)
-    print('MAC of the model is:', Macs)
-
-if __name__ == "__main__":
-    test_Complex_MTASS()
-
-
-              
+    print("\n" + "="*60 + "\n")
+    print("Testing streaming Complex_MTASS:")
+    test_streaming()

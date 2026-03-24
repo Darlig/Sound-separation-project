@@ -7,9 +7,9 @@ import scipy.io.wavfile as wav
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-from DNN_models.Complex_MTASS_model import ComplexMTASSLightning
-from DNN_models.Complex_MTASS import *
-from DNN_models.Complex_MTASS_Solver import *
+from DNN_models.Complex_MTASS_model_Streaming import ComplexMTASSStreamingLightning
+from DNN_models.Complex_MTASS_Streaming import *
+from DNN_models.Complex_MTASS_Solver_Streaming import *
 
 def masked_metric(estimate, target, eps=1e-8):
     target_energy = torch.sum(target ** 2, dim=-1)
@@ -30,9 +30,8 @@ def masked_metric(estimate, target, eps=1e-8):
     return sdr_vector, sisdr_vector, mask_float
   
 def compute_out_cost(mix, Z1, Z2, Z3, R1, R2, R3):
-    ### START CODE HERE ###
     win_len = 512
-    win_inc = 256 # frame shift
+    win_inc = 256
     fft_len = 512
     Z1_time = Inverse_STFT(Z1, win_len, win_inc, fft_len)
     Z2_time = Inverse_STFT(Z2, win_len, win_inc, fft_len)
@@ -98,13 +97,11 @@ def sisdr_cost(estimated, target, eps=1e-8):
     return sisdr.squeeze(-1)
 
 def Inverse_STFT(inputs, win_len, win_hop, fft_len):
-    # inputs.shape = [B,fea_size,sen_len] (Complex STFT)
     cutoff = fft_len // 2 + 1
     real_part = inputs[:, :cutoff, :]
     imag_part = inputs[:, cutoff:, :]
 
     complex_spec = torch.complex(real_part, imag_part)
-    #istft_window = torch.ones(win_len, device=inputs.device)
     istft_window = torch.hamming_window(win_len, device=inputs.device)
 
     reconstruction = torch.istft(
@@ -156,17 +153,126 @@ class HDF5Dataset(Dataset):
         
         return X1, R_targets, idx
 
-def test(args):
-    device = torch.device("cuda" if args.use_cuda and torch.cuda.is_available() else "cpu")
+def test_non_streaming(args, model, test_loader, device):
+    """Test using non-streaming inference (for comparison)."""
+    print("="*60)
+    print("Testing with NON-STREAMING inference (reference)...")
+    print("="*60)
+    
     win_len = 512
     win_inc = 256
     fft_len = 512
     fs = 16000
+    
+    labels = ["speech", "music", "others"]
+    total_sdr_list = []
+    total_sisdr_list = []
+
+    with torch.no_grad():
+        for batch in tqdm(test_loader, desc="Non-streaming"):
+            X1, T1, R_targets, idx = batch
+            X1 = X1.to(device)
+
+            R_gt_speech = R_targets[0].to(device)
+            R_gt_music  = R_targets[1].to(device)
+            R_gt_others  = R_targets[2].to(device)
+
+            Z1, Z2, Z3 = model(X1)
+            mixture = Inverse_STFT(X1, win_len, win_inc, fft_len)
+            total_sdr, total_sisdr, Z1_time, Z2_time, Z3_time, speech_sisdr, music_sisdr, others_sisdr, total_mask = compute_out_cost(mixture, Z1, Z2, Z3, R_gt_speech, R_gt_music, R_gt_others)
+            
+            total_sdr_list.append(total_sdr)
+            total_sisdr_list.append(total_sisdr)
+
+    avg_sdr = torch.mean(torch.tensor(total_sdr_list))
+    avg_sisdr = torch.mean(torch.tensor(total_sisdr_list))
+
+    print(f"Non-streaming Total SDR: {avg_sdr:.4f}")
+    print(f"Non-streaming Total SI-SDR: {avg_sisdr:.4f}")
+    
+    return avg_sdr, avg_sisdr
+
+def test_streaming(args, model, test_loader, device, chunk_size=1):
+    """Test using streaming inference."""
+    print("="*60)
+    print(f"Testing with STREAMING inference (chunk_size={chunk_size})...")
+    print("="*60)
+    
+    win_len = 512
+    win_inc = 256
+    fft_len = 512
+    fs = 16000
+    
+    labels = ["speech", "music", "others"]
+    total_sdr_list = []
+    total_sisdr_list = []
+    
+    inference_times = []
+
+    with torch.no_grad():
+        for batch in tqdm(test_loader, desc=f"Streaming (chunk={chunk_size})"):
+            X1, T1, R_targets, idx = batch
+            X1 = X1.to(device)
+
+            R_gt_speech = R_targets[0].to(device)
+            R_gt_music  = R_targets[1].to(device)
+            R_gt_others  = R_targets[2].to(device)
+
+            # Reset streaming state for each sample
+            model.reset_streaming_state()
+            
+            # Streaming inference
+            import time
+            start_time = time.time()
+            Z1, Z2, Z3 = Complex_MTASS_model_Streaming.streaming_separation(
+                model.model, X1, chunk_size=chunk_size
+            )
+            end_time = time.time()
+            inference_times.append(end_time - start_time)
+            
+            mixture = Inverse_STFT(X1, win_len, win_inc, fft_len)
+            total_sdr, total_sisdr, Z1_time, Z2_time, Z3_time, speech_sisdr, music_sisdr, others_sisdr, total_mask = compute_out_cost(mixture, Z1, Z2, Z3, R_gt_speech, R_gt_music, R_gt_others)
+            
+            sisdr_values = {
+                'total': total_sisdr,
+                'speech': speech_sisdr,
+                'music': music_sisdr,
+                'others': others_sisdr
+            }
+            total_sdr_list.append(total_sdr)
+            total_sisdr_list.append(total_sisdr)
+
+            # Save results for first few samples
+            if idx.item() < args.save_n_samples:
+                result_label = create_sisdr_string(total_mask, sisdr_values, labels, ".2f")
+                save_dir = os.path.join(args.output_dir, f"sample{idx.item()}_{result_label}_streaming")
+                os.makedirs(save_dir, exist_ok=True)
+                wav_write(mixture.squeeze(), save_dir, "mixture.wav", fs)
+                wav_write(R_gt_speech.squeeze(), save_dir, "speech_gt.wav", fs)
+                wav_write(R_gt_music.squeeze(), save_dir, "music_gt.wav", fs)
+                wav_write(R_gt_others.squeeze(), save_dir, "others_gt.wav", fs)
+                wav_write(Z1_time.squeeze(), save_dir, "speech_es.wav", fs)
+                wav_write(Z2_time.squeeze(),  save_dir,  "music_es.wav", fs)
+                wav_write(Z3_time.squeeze(),  save_dir,  "others_es.wav", fs)
+
+    avg_sdr = torch.mean(torch.tensor(total_sdr_list))
+    avg_sisdr = torch.mean(torch.tensor(total_sisdr_list))
+    avg_time = np.mean(inference_times)
+
+    print(f"Streaming Total SDR: {avg_sdr:.4f}")
+    print(f"Streaming Total SI-SDR: {avg_sisdr:.4f}")
+    print(f"Average inference time per sample: {avg_time*1000:.2f} ms")
+    
+    return avg_sdr, avg_sisdr, avg_time
+
+def test(args):
+    device = torch.device("cuda" if args.use_cuda and torch.cuda.is_available() else "cpu")
     print(f"Testing on: {device}")
-    model = ComplexMTASSLightning.load_from_checkpoint(
+    
+    model = ComplexMTASSStreamingLightning.load_from_checkpoint(
         args.ckpt_path,
-        model_class=Complex_MTASS,
-        loss_class=Complex_MTASS_model,
+        model_class=StreamingComplexMTASS,
+        loss_class=Complex_MTASS_model_Streaming,
     )
     model.to(device)
     model.eval()
@@ -180,60 +286,43 @@ def test(args):
         num_workers=4
     )
 
-    print("Start inference...")
-    labels = ["speech", "music", "others"]
-    total_sdr_list = []
-    total_sisdr_list = []
-
-    with torch.no_grad():
-        for batch in tqdm(test_loader):
-            X1, T1, R_targets, idx = batch
-            X1 = X1.to(device)
-
-            R_gt_speech = R_targets[0].to(device)
-            R_gt_music  = R_targets[1].to(device)
-            R_gt_others  = R_targets[2].to(device)
-
-            Z1, Z2, Z3 = model(X1)
-            mixture = Inverse_STFT(X1, win_len, win_inc, fft_len)
-            total_sdr, total_sisdr, Z1_time, Z2_time, Z3_time, speech_sisdr, music_sisdr, others_sisdr, total_mask =  compute_out_cost(mixture, Z1, Z2, Z3, R_gt_speech, R_gt_music, R_gt_others)
-            sisdr_values = {
-                'total': total_sisdr,
-                'speech': speech_sisdr,
-                'music': music_sisdr,
-                'others': others_sisdr
-            }
-            total_sdr_list.append(total_sdr)
-            total_sisdr_list.append(total_sisdr)
-
-            result_label = create_sisdr_string(total_mask, sisdr_values, labels, ".2f")
-            save_dir = os.path.join(args.output_dir, f"sample{idx.item()}_{result_label}")
-            os.makedirs(save_dir, exist_ok=True)
-            wav_write(mixture.squeeze(), save_dir, "mixture.wav", fs)
-            wav_write(R_gt_speech.squeeze(), save_dir, "speech_gt.wav", fs)
-            wav_write(R_gt_music.squeeze(), save_dir, "music_gt.wav", fs)
-            wav_write(R_gt_others.squeeze(), save_dir, "others_gt.wav", fs)
-            wav_write(Z1_time.squeeze(), save_dir, "speech_es.wav", fs)
-            wav_write(Z2_time.squeeze(),  save_dir,  "music_es.wav", fs)
-            wav_write(Z3_time.squeeze(),  save_dir,  "others_es.wav", fs)
-
-    avg_sdr = torch.mean(torch.tensor(total_sdr_list))
-    avg_sisdr = torch.mean(torch.tensor(total_sisdr_list))
-
-    print(f"Total SDR: {avg_sdr:.4f}")
-    print(f"Total SI-SDR: {avg_sisdr:.4f}")
+    os.makedirs(args.output_dir, exist_ok=True)
+    
+    # Non-streaming test (reference)
+    if args.test_non_streaming:
+        non_streaming_sdr, non_streaming_sisdr = test_non_streaming(args, model, test_loader, device)
+    
+    # Streaming test
+    streaming_sdr, streaming_sisdr, avg_time = test_streaming(args, model, test_loader, device, chunk_size=args.chunk_size)
+    
+    # Compare results
+    if args.test_non_streaming:
+        print("\n" + "="*60)
+        print("COMPARISON:")
+        print("="*60)
+        print(f"Non-streaming SI-SDR: {non_streaming_sisdr:.4f}")
+        print(f"Streaming SI-SDR:     {streaming_sisdr:.4f}")
+        print(f"Difference:           {abs(non_streaming_sisdr - streaming_sisdr):.4f}")
+        if abs(non_streaming_sisdr - streaming_sisdr) < 0.1:
+            print("✓ Streaming and non-streaming results match!")
+        else:
+            print("⚠ Warning: Results differ significantly")
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description='Streaming Test for Complex MTASS Model')
     parser.add_argument('--test_h5', type=str, required=True, help='Path to test data .h5')
     parser.add_argument('--ckpt_path', type=str, required=True, help='Path to model checkpoint .ckpt')
-    parser.add_argument('--output_dir', type=str, default='./test_results', help='Folder to save wavs')
+    parser.add_argument('--output_dir', type=str, default='./test_streaming_results', help='Folder to save wavs')
     parser.add_argument('--num_sources', type=int, choices=[2, 3, 4, 5], required=True,
                        help='混合声源数量: 2, 3, 4 或 5')
     parser.add_argument('--use_cuda', action='store_true', default=True)
+    parser.add_argument('--chunk_size', type=int, default=1, 
+                       help='Number of frames to process at once in streaming mode (default: 1 for frame-by-frame)')
+    parser.add_argument('--test_non_streaming', action='store_true', default=True,
+                       help='Also test non-streaming inference for comparison')
+    parser.add_argument('--save_n_samples', type=int, default=10,
+                       help='Number of samples to save audio files for')
     
     args = parser.parse_args()
 
-    os.makedirs(args.output_dir, exist_ok=True)
-    
     test(args)

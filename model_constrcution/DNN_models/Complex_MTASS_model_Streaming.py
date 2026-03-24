@@ -1,9 +1,16 @@
 import torch
 import pytorch_lightning as pl
-from DNN_models.Complex_MTASS import *
-from DNN_models.Complex_MTASS_Solver import *
+from DNN_models.Complex_MTASS_Streaming import *
+from DNN_models.Complex_MTASS_Solver_Streaming import *
 
-class ComplexMTASSLightning(pl.LightningModule):
+class ComplexMTASSStreamingLightning(pl.LightningModule):
+    """
+    PyTorch Lightning module for Streaming Complex MTASS model.
+    
+    Supports both:
+    - Non-streaming training (with causal self-attention mask)
+    - Streaming inference (frame-by-frame processing with state management)
+    """
     def __init__(self, learning_rate, model_class, loss_class):
         super().__init__()
         self.save_hyperparameters(ignore=['model_class', 'loss_class'])
@@ -12,7 +19,16 @@ class ComplexMTASSLightning(pl.LightningModule):
         self.learning_rate = learning_rate
 
     def forward(self, x):
+        """Non-streaming forward pass for training."""
         return self.model(x)
+    
+    def streaming_forward(self, x):
+        """Streaming forward pass for inference."""
+        return self.model.streaming_forward(x)
+    
+    def reset_streaming_state(self):
+        """Reset the streaming state for new utterance."""
+        self.model.reset_state()
 
     def training_step(self, batch, batch_idx):
         X1 = batch[0]
@@ -22,7 +38,6 @@ class ComplexMTASSLightning(pl.LightningModule):
         Z1, Z2, Z3 = self(X1)
 
         loss, mse_loss, sisdr_loss = self.loss_wrapper.compute_out_cost(Z1, Z2, Z3, Y_targets, R_targets)
-        #loss = self.loss_wrapper.compute_out_cost(Z1, Z2, Z3, Y_targets, R_targets)
 
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log('mse_loss', mse_loss, on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
@@ -38,7 +53,6 @@ class ComplexMTASSLightning(pl.LightningModule):
         with torch.no_grad():
             Z1, Z2, Z3 = self(X1)
             loss, mse_loss, sisdr_loss = self.loss_wrapper.compute_out_cost(Z1, Z2, Z3, Y_targets, R_targets)
-            #loss = self.loss_wrapper.compute_out_cost(Z1, Z2, Z3, Y_targets, R_targets)
         
         self.log('val_loss', loss, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log('val_mse_loss', mse_loss, on_epoch=True, prog_bar=False, sync_dist=True)

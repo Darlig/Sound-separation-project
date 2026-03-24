@@ -1,4 +1,5 @@
 
+
 import math
 import numpy as np
 import torch
@@ -26,7 +27,7 @@ from torch.utils.tensorboard import SummaryWriter
 import sys
 sys.path.append("..")
 from utils.utils_library_gpu import *
-from DNN_models.Complex_MTASS import *
+from DNN_models.Complex_MTASS_Streaming import *
 
 
 
@@ -34,20 +35,27 @@ from DNN_models.Complex_MTASS import *
 
 # -----------------------------------------------------------------------------------------------------------------------------
 # * Class:
-#     Complex_MTASS_model---Implements a Complex-domain MTASS model for speech, noise and music separation 
+#     Complex_MTASS_model_Streaming---Implements a Complex-domain MTASS model for speech, noise and music separation 
+#                                       with Streaming (Causal) Self-Attention support
 # 
 # * Note:
 #   The Complex MTASS model takes the mixture Mag feratures as the inputs 
 #   and outputs the complex ratio masks (cRMs).
 #   In this model, 8 sub-bands are divided and performed the multi-scale analysis.
+#   **Streaming version supports frame-by-frame inference for real-time applications.**
 #   
 #
 # * Copyright and Authors:
 #    Writen by Mr. Wind at Harbin Institute of Technology, Shenzhen.
 #    Contact Email: zhanglu_wind@163.com
+#
+# * Streaming Modifications:
+#    - Added streaming inference support with state management
+#    - Added causal mask to self-attention for training
+#    - Added frame-by-frame processing utilities
 # -----------------------------------------------------------------------------------------------------------------------------
 
-class Complex_MTASS_model:
+class Complex_MTASS_model_Streaming:
 
     #-------------------------------------------------------------------------------------------------------------------
     # * Functions:
@@ -70,6 +78,7 @@ class Complex_MTASS_model:
         ### START CODE HERE ###
         print('The Complex MTASS learning structure (Mag_to_Com, Residual Compensation, F-MSE+T-SNR) is : 257+ComplexMSTCN(15)+3*GTCN(5,8)+(514,514,514)')
         print('The Complex MTASS model is trained to separate three targets!') 
+        print('*** Streaming Version with Causal Self-Attention ***')
         print('The sizes of each train/dev file are as follows:')
         num_minibatches_train = 0
         num_minibatches_dev = 0        
@@ -102,7 +111,7 @@ class Complex_MTASS_model:
         if mask.sum() > 0:
             valid_est = estimate[mask]
             valid_tgt = target[mask]
-            valid_sisdr = Complex_MTASS_model.sisdr_cost(valid_est, valid_tgt)
+            valid_sisdr = Complex_MTASS_model_Streaming.sisdr_cost(valid_est, valid_tgt)
             loss_vector[mask] = -valid_sisdr
         mask_float = mask.float()  
         return loss_vector, mask_float
@@ -112,18 +121,18 @@ class Complex_MTASS_model:
         win_len = 512
         win_inc = 256 # frame shift
         fft_len = 512
-        Z1_time = Complex_MTASS_model.Inverse_STFT(Z1, win_len, win_inc, fft_len)
-        Z2_time = Complex_MTASS_model.Inverse_STFT(Z2, win_len, win_inc, fft_len)
-        Z3_time = Complex_MTASS_model.Inverse_STFT(Z3, win_len, win_inc, fft_len)
+        Z1_time = Complex_MTASS_model_Streaming.Inverse_STFT(Z1, win_len, win_inc, fft_len)
+        Z2_time = Complex_MTASS_model_Streaming.Inverse_STFT(Z2, win_len, win_inc, fft_len)
+        Z3_time = Complex_MTASS_model_Streaming.Inverse_STFT(Z3, win_len, win_inc, fft_len)
         Y1, Y2, Y3 = Y_targets[0], Y_targets[1], Y_targets[2]
         R1, R2, R3 = R_targets[0], R_targets[1], R_targets[2]
         
         mse_cost = torch.nn.MSELoss()
         cost_freq = mse_cost(Z1, Y1) + mse_cost(Z2, Y2) + mse_cost(Z3, Y3)
 
-        loss_s, mask_s = Complex_MTASS_model.masked_sisdr_loss(Z1_time, R1)
-        loss_m, mask_m = Complex_MTASS_model.masked_sisdr_loss(Z2_time, R2)
-        loss_o, mask_o = Complex_MTASS_model.masked_sisdr_loss(Z3_time, R3)
+        loss_s, mask_s = Complex_MTASS_model_Streaming.masked_sisdr_loss(Z1_time, R1)
+        loss_m, mask_m = Complex_MTASS_model_Streaming.masked_sisdr_loss(Z2_time, R2)
+        loss_o, mask_o = Complex_MTASS_model_Streaming.masked_sisdr_loss(Z3_time, R3)
         sum_loss = loss_s + loss_m + loss_o
         num_tasks = mask_s + mask_m + mask_o
         num_tasks = torch.clamp(num_tasks, min=1.0)
@@ -179,3 +188,126 @@ class Complex_MTASS_model:
         )
         
         return reconstruction
+    
+    #-------------------------------------------------------------------------------------------------------------------
+    # Streaming Inference Utilities
+    #-------------------------------------------------------------------------------------------------------------------
+    
+    def streaming_separation(model, input_frames, chunk_size=1):
+        """
+        Perform streaming separation on input frames.
+        
+        Args:
+            model: StreamingComplexMTASS model instance
+            input_frames: Input STFT frames of shape [batch, 514, num_frames]
+            chunk_size: Number of frames to process at once (default: 1 for frame-by-frame)
+        
+        Returns:
+            y1_out, y2_out, y3_out: Separated speech, music, others [batch, 514, num_frames]
+        """
+        model.eval()
+        model.reset_state()
+        
+        batch_size, feature_dim, total_frames = input_frames.shape
+        
+        y1_list, y2_list, y3_list = [], [], []
+        
+        with torch.no_grad():
+            for start_idx in range(0, total_frames, chunk_size):
+                end_idx = min(start_idx + chunk_size, total_frames)
+                chunk = input_frames[:, :, start_idx:end_idx]
+                
+                y1_chunk, y2_chunk, y3_chunk = model.streaming_forward(chunk)
+                
+                y1_list.append(y1_chunk)
+                y2_list.append(y2_chunk)
+                y3_list.append(y3_chunk)
+        
+        y1_out = torch.cat(y1_list, dim=-1)
+        y2_out = torch.cat(y2_list, dim=-1)
+        y3_out = torch.cat(y3_list, dim=-1)
+        
+        return y1_out, y2_out, y3_out
+    
+    def streaming_separation_with_overlap_add(model, mixture_signal, win_len=512, win_inc=256, 
+                                               fft_len=512, chunk_size=1, device='cpu'):
+        """
+        Complete streaming separation pipeline from time-domain signal to separated signals.
+        
+        Args:
+            model: StreamingComplexMTASS model instance
+            mixture_signal: Input time-domain signal [batch, num_samples]
+            win_len: Window length for STFT
+            win_inc: Frame shift for STFT
+            fft_len: FFT length
+            chunk_size: Number of frames to process at once
+            device: Device to run on
+        
+        Returns:
+            speech, music, others: Separated time-domain signals [batch, num_samples]
+        """
+        model.eval()
+        model.to(device)
+        model.reset_state()
+        
+        batch_size, num_samples = mixture_signal.shape
+        
+        # Create window
+        window = torch.hamming_window(win_len, device=device)
+        
+        # Compute STFT
+        mixture_signal = mixture_signal.to(device)
+        
+        # Pad signal for STFT
+        pad_length = win_len
+        mixture_padded = F.pad(mixture_signal, (pad_length, pad_length), mode='constant', value=0.0)
+        
+        # Compute STFT
+        complex_spec = torch.stft(
+            mixture_padded,
+            n_fft=fft_len,
+            hop_length=win_inc,
+            win_length=win_len,
+            window=window,
+            center=False,
+            normalized=False,
+            onesided=True,
+            return_complex=True
+        )
+        
+        # Convert to RI format
+        real_part = complex_spec.real
+        imag_part = complex_spec.imag
+        ri_input = torch.cat([real_part, imag_part], dim=1)  # [batch, 514, num_frames]
+        
+        # Streaming separation
+        y1_ri, y2_ri, y3_ri = Complex_MTASS_model_Streaming.streaming_separation(
+            model, ri_input, chunk_size=chunk_size
+        )
+        
+        # Convert back to complex and perform ISTFT
+        def ri_to_time(ri_spec):
+            cutoff = fft_len // 2 + 1
+            real = ri_spec[:, :cutoff, :]
+            imag = ri_spec[:, cutoff:, :]
+            complex_out = torch.complex(real, imag)
+            
+            time_sig = torch.istft(
+                complex_out,
+                n_fft=fft_len,
+                hop_length=win_inc,
+                win_length=win_len,
+                window=window,
+                center=False,
+                normalized=False,
+                onesided=True,
+                return_complex=False,
+                length=num_samples + 2 * pad_length
+            )
+            return time_sig[:, pad_length:pad_length+num_samples]
+        
+        speech = ri_to_time(y1_ri)
+        music = ri_to_time(y2_ri)
+        others = ri_to_time(y3_ri)
+        
+        return speech, music, others

@@ -7,11 +7,11 @@ from torch.utils.data import DataLoader
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
 
-from DNN_models.Complex_MTASS_model import ComplexMTASSLightning
-from DNN_models.Complex_MTASS import *
-from DNN_models.Complex_MTASS_Solver import *
+from DNN_models.Complex_MTASS_model_Streaming import ComplexMTASSStreamingLightning
+from DNN_models.Complex_MTASS_Streaming import *
+from DNN_models.Complex_MTASS_Solver_Streaming import *
 
-class HDF5Dataset(Dataset):
+class HDF5Dataset:
     def __init__(self, h5_path):
         self.h5_path = h5_path
         self.h5_file = None
@@ -37,26 +37,41 @@ class HDF5Dataset(Dataset):
 
 def main(args):
     pl.seed_everything(42)
+    
+    print("="*60)
+    print("Training Streaming Complex MTASS Model")
+    print("="*60)
+    print(f"Model: StreamingComplexMTASS with Causal Self-Attention")
+    print(f"Self-Attention: apply_self_attn = True")
+    print(f"Causal Mask: Enabled for streaming support")
+    print("="*60)
+    
     # Load dataset
     data_train = HDF5Dataset(args.train_h5)
     data_val = HDF5Dataset(args.val_h5)
-    train_loader = DataLoader(data_train,
-                              batch_size=args.batch_size,
-                              shuffle=True,
-                              num_workers=args.n_workers,
-                              pin_memory=True,
-                              drop_last=True)
-    val_loader = DataLoader(data_val,
-                            batch_size=args.eval_batch_size,
-                            shuffle=False,
-                            num_workers=args.n_workers,
-                            pin_memory=True,
-                            drop_last=True)
     
-    model = ComplexMTASSLightning(
+    train_loader = DataLoader(
+        data_train,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.n_workers,
+        pin_memory=True,
+        drop_last=True
+    )
+    
+    val_loader = DataLoader(
+        data_val,
+        batch_size=args.eval_batch_size,
+        shuffle=False,
+        num_workers=args.n_workers,
+        pin_memory=True,
+        drop_last=True
+    )
+    
+    model = ComplexMTASSStreamingLightning(
         learning_rate=args.lr,
-        model_class=Complex_MTASS,
-        loss_class=Complex_MTASS_model
+        model_class=StreamingComplexMTASS,
+        loss_class=Complex_MTASS_model_Streaming
     )
 
     checkpoint_callback = ModelCheckpoint(
@@ -81,7 +96,6 @@ def main(args):
         callbacks=[checkpoint_callback],
         gradient_clip_val=20.0 if args.gradient_clip else 0.0,
         precision='32',
-        #log_every_n_steps=10,
     )
 
     ckpt_path = None
@@ -90,10 +104,17 @@ def main(args):
         ckpt_path = args.resume_ckpt
     
     trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader, ckpt_path=ckpt_path)
+    
+    print("\n" + "="*60)
+    print("Training completed!")
+    print(f"Model saved to: {os.path.join(args.exp_dir, 'checkpoints')}")
+    print("="*60)
+    print("\nTo test the streaming model, run:")
+    print(f"  python test_streaming.py --test_h5 <test.h5> --ckpt_path {os.path.join(args.exp_dir, 'checkpoints', 'last.ckpt')} --num_sources 3")
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('exp_dir', type=str, default='./model_parameters')
+    parser = argparse.ArgumentParser(description='Train Streaming Complex MTASS Model')
+    parser.add_argument('exp_dir', type=str, default='./model_parameters_streaming')
     parser.add_argument('--train_h5', type=str, default='/ssd2.m2/sound/VGGSound/imagebind/train_ready.h5')
     parser.add_argument('--val_h5', type=str, default='/ssd2.m2/sound/VGGSound/imagebind/dev_ready.h5')
     parser.add_argument('--resume_ckpt', type=str, default=None, help="Path to .ckpt to continue training")
@@ -113,4 +134,3 @@ if __name__ == '__main__':
     os.makedirs(args.exp_dir, exist_ok=True)
     
     main(args)
-

@@ -32,7 +32,7 @@ python create_csv.py  --input_csv /dataset/3class_data_nosing/train.csv  --outpu
 
 ## 特征提取：
 ```bash
-python extract_features.py --input_csv_list dataset/3class_data_nosing/metadata/train_2mix.csv dataset/3class_data_nosing/metadata/train_3mix.csv dataset/3class_data_nosing/metadata/train_4mix.csv dataset/3class_data_nosing/metadata/train_5mix.csv --output_dir /processed_data/3class_nosing --split train
+python extract_features.py  
 ```
 ## 模型训练：
 ```bash
@@ -41,5 +41,5 @@ bash run.sh
 ```
 ## 测试及推理：
 ```bash
-bash eval.sh
+bash eval.sh 
 ```
