@@ -196,12 +196,24 @@ class MS_ResBlock(nn.Module):
         self.conv1d_1 = Conv_layer_1d(1028, 257)
         self.conv1d_2 = Conv_layer_1d(514, 1028)
         self.ms_conv1d = MS_dilated_layer_514d(self.k,self.dilation)
+        self.reset_state()
+    
+    def reset_state(self):
+        self.ms_conv1d.reset_state()
 
     def forward(self, prev_x, forw_x):
         x = self.conv1d_1(prev_x) # x.shape = [-1,257,sen_len]
         x = torch.cat((forw_x,x),1) # x.shape = [-1,257+257,sen_len]
         x = self.ms_conv1d(x) # x.shape = [-1,514,sen_len]
         x = self.conv1d_2(x) # x.shape = [-1,1028,sen_len]
+        x = x + prev_x
+        return x
+    
+    def streaming_forward(self, prev_x, forw_x):
+        x = self.conv1d_1(prev_x)
+        x = torch.cat((forw_x,x),1)
+        x = self.ms_conv1d.streaming_forward(x)
+        x = self.conv1d_2(x)
         x = x + prev_x
         return x
 
@@ -223,6 +235,7 @@ class Conv1d_sub(nn.Module):
         super(Conv1d_sub, self).__init__()
         self.input_dim, self.output_dim, self.k, self.dila = input_dim, output_dim, k, dila
         self.is_causal = True
+        self.required_history = 2 * self.dila
         if self.is_causal:
             pad = nn.ConstantPad1d((2*self.dila, 0), value=0.)
         else:
@@ -234,10 +247,28 @@ class Conv1d_sub(nn.Module):
             nn.ReLU(self.output_dim),
             nn.Dropout(0.2)
         )
-
+        self.reset_state()
+    
+    def reset_state(self):
+        self.input_buffer = None
+    
     def forward(self, x):
         x = self.unit(x)
         return x
+    
+    def streaming_forward(self, x):
+        batch_size, _, current_len = x.shape
+        
+        if self.input_buffer is None:
+            self.input_buffer = torch.zeros(
+                batch_size, self.input_dim, self.required_history,
+                device=x.device, dtype=x.dtype
+            )
+        
+        full_input = torch.cat([self.input_buffer, x], dim=-1)
+        self.input_buffer = full_input[:, :, -self.required_history:]
+        x_out = self.unit(full_input)
+        return x_out[:, :, -current_len:]
     
 class MS_dilated_layer_514d(nn.Module):
     def __init__(self, k, dilas):
@@ -266,6 +297,17 @@ class MS_dilated_layer_514d(nn.Module):
             else:
                 right_unit_list.append(Conv1d_sub(129, 65, self.k, self.dilas))                
         self.left_unit_list, self.right_unit_list = nn.ModuleList(left_unit_list), nn.ModuleList(right_unit_list)
+        self.reset_state()
+    
+    def reset_state(self):
+        for unit in self.left_unit_list:
+            unit.reset_state()
+        for unit in self.right_unit_list:
+            unit.reset_state()
+    
+    def forward(self, inpt):
+        # split the tensor into several sub-bands
+        # inpt.shape = [-1,514,sen_len]
 
 
     def forward(self, inpt):
@@ -331,6 +373,66 @@ class MS_dilated_layer_514d(nn.Module):
         # subconv_out.shape = [-1,514,sen_len]
 
 
+        return subconv_out
+    
+    def streaming_forward(self, inpt):
+        # split the tensor into several sub-bands
+        num_subs = 8
+        s0 = inpt[:,:64,:]
+        s1 = inpt[:,64:128,:]
+        s2 = inpt[:,128:192,:]
+        s3 = inpt[:,192:257,:]
+        s4 = inpt[:,257:321,:]
+        s5 = inpt[:,321:385,:]
+        s6 = inpt[:,385:449,:]
+        s7 = inpt[:,449:514,:]
+
+        # Left direction multi-scale decomposion
+        Left_subconv_out0 = self.left_unit_list[0].streaming_forward(s0)
+        s = torch.cat((Left_subconv_out0, s1), 1)
+        Left_subconv_out1 = self.left_unit_list[1].streaming_forward(s)
+        s = torch.cat((Left_subconv_out1, s2), 1)
+        Left_subconv_out2 =self.left_unit_list[2].streaming_forward(s)
+        s = torch.cat((Left_subconv_out2, s3), 1)
+        Left_subconv_out3 = self.left_unit_list[3].streaming_forward(s)
+        s = torch.cat((Left_subconv_out3, s4), 1)
+        Left_subconv_out4 = self.left_unit_list[4].streaming_forward(s)
+        s = torch.cat((Left_subconv_out4, s5), 1)
+        Left_subconv_out5 = self.left_unit_list[5].streaming_forward(s)
+        s = torch.cat((Left_subconv_out5, s6), 1)
+        Left_subconv_out6 = self.left_unit_list[6].streaming_forward(s)
+        s = torch.cat((Left_subconv_out6, s7), 1)
+        Left_subconv_out7 = self.left_unit_list[7].streaming_forward(s)
+
+        # Right direction multi-scale decomposion
+        Right_subconv_out7 = self.right_unit_list[7].streaming_forward(s7)
+        s = torch.cat((s6,Right_subconv_out7),1)
+        Right_subconv_out6 = self.right_unit_list[6].streaming_forward(s)
+        s = torch.cat((s5,Right_subconv_out6),1)
+        Right_subconv_out5 = self.right_unit_list[5].streaming_forward(s)
+        s = torch.cat((s4,Right_subconv_out5),1)
+        Right_subconv_out4 = self.right_unit_list[4].streaming_forward(s)
+        s = torch.cat((s3,Right_subconv_out4),1)
+        Right_subconv_out3 = self.right_unit_list[3].streaming_forward(s)
+        s = torch.cat((s2,Right_subconv_out3),1)
+        Right_subconv_out2 = self.right_unit_list[2].streaming_forward(s)
+        s = torch.cat((s1,Right_subconv_out2),1)
+        Right_subconv_out1 = self.right_unit_list[1].streaming_forward(s)
+        s = torch.cat((s0,Right_subconv_out1),1)
+        Right_subconv_out0 = self.right_unit_list[0].streaming_forward(s)
+
+        # Sum the analysis results
+        subconv_out0 = Left_subconv_out0 + Right_subconv_out0
+        subconv_out1 = Left_subconv_out1 + Right_subconv_out1
+        subconv_out2 = Left_subconv_out2 + Right_subconv_out2
+        subconv_out3 = Left_subconv_out3 + Right_subconv_out3
+        subconv_out4 = Left_subconv_out4 + Right_subconv_out4
+        subconv_out5 = Left_subconv_out5 + Right_subconv_out5
+        subconv_out6 = Left_subconv_out6 + Right_subconv_out6
+        subconv_out7 = Left_subconv_out7 + Right_subconv_out7
+
+        # Concatenate the sub-band outputs
+        subconv_out = torch.cat((subconv_out0,subconv_out1,subconv_out2,subconv_out3,subconv_out4,subconv_out5,subconv_out6,subconv_out7),1)
         return subconv_out        
         
 #-------------------------------------------------------        
@@ -798,6 +900,22 @@ class StreamingComplexMTASS(nn.Module):
     
     def reset_state(self):
         """Reset all internal states for new utterance."""
+        self.ms_resblock_1.reset_state()
+        self.ms_resblock_2.reset_state()
+        self.ms_resblock_3.reset_state()
+        self.ms_resblock_4.reset_state()
+        self.ms_resblock_5.reset_state()
+        self.ms_resblock_6.reset_state()
+        self.ms_resblock_7.reset_state()
+        self.ms_resblock_8.reset_state()
+        self.ms_resblock_9.reset_state()
+        self.ms_resblock_10.reset_state()
+        self.ms_resblock_11.reset_state()
+        self.ms_resblock_12.reset_state()
+        self.ms_resblock_13.reset_state()
+        self.ms_resblock_14.reset_state()
+        self.ms_resblock_15.reset_state()
+        
         self.speech_res_block.reset_state()
         self.music_res_block.reset_state()
         self.others_res_block.reset_state()
@@ -826,21 +944,21 @@ class StreamingComplexMTASS(nn.Module):
         x_mag = torch.norm(x_ri, dim=1)
         
         x = self.conv1d_1(x_mag)
-        x = self.ms_resblock_1(x, x_mag)
-        x = self.ms_resblock_2(x, x_mag)
-        x = self.ms_resblock_3(x, x_mag)
-        x = self.ms_resblock_4(x, x_mag)
-        x = self.ms_resblock_5(x, x_mag)
-        x = self.ms_resblock_6(x, x_mag)
-        x = self.ms_resblock_7(x, x_mag)
-        x = self.ms_resblock_8(x, x_mag)
-        x = self.ms_resblock_9(x, x_mag)
-        x = self.ms_resblock_10(x, x_mag)
-        x = self.ms_resblock_11(x, x_mag)
-        x = self.ms_resblock_12(x, x_mag)
-        x = self.ms_resblock_13(x, x_mag)
-        x = self.ms_resblock_14(x, x_mag)
-        x = self.ms_resblock_15(x, x_mag)
+        x = self.ms_resblock_1.streaming_forward(x, x_mag)
+        x = self.ms_resblock_2.streaming_forward(x, x_mag)
+        x = self.ms_resblock_3.streaming_forward(x, x_mag)
+        x = self.ms_resblock_4.streaming_forward(x, x_mag)
+        x = self.ms_resblock_5.streaming_forward(x, x_mag)
+        x = self.ms_resblock_6.streaming_forward(x, x_mag)
+        x = self.ms_resblock_7.streaming_forward(x, x_mag)
+        x = self.ms_resblock_8.streaming_forward(x, x_mag)
+        x = self.ms_resblock_9.streaming_forward(x, x_mag)
+        x = self.ms_resblock_10.streaming_forward(x, x_mag)
+        x = self.ms_resblock_11.streaming_forward(x, x_mag)
+        x = self.ms_resblock_12.streaming_forward(x, x_mag)
+        x = self.ms_resblock_13.streaming_forward(x, x_mag)
+        x = self.ms_resblock_14.streaming_forward(x, x_mag)
+        x = self.ms_resblock_15.streaming_forward(x, x_mag)
         x = self.conv1d_2(x)
         
         y1_mask = self.conv1d_3(x)
