@@ -201,7 +201,8 @@ class WavDataset(Dataset):
             music_gt_wav = music_gt_wav[:, 0]
             others_gt_wav = others_gt_wav[:, 0]
         
-        mixture_tensor = torch.from_numpy(mixture_wav).float().unsqueeze(0).unsqueeze(0)
+        mixture_tensor = torch.from_numpy(mixture_wav).float().unsqueeze(0)  # [time]
+        mixture_tensor = mixture_tensor.unsqueeze(0).transpose(1, 2)  # [batch, time] → [batch, freq, time]
         X1 = STFT(mixture_tensor)
         
         speech_gt_tensor = torch.from_numpy(speech_gt_wav).float()
