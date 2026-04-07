@@ -99,12 +99,10 @@ class AudioDataset(Dataset):
 
             if 'speech' in label_lower:
                 s1 += current_source
-            elif 'concert' in label_lower:
+            elif 'music' in label_lower:
                 s2 += current_source
-            elif 'bird' in label_lower:
-                s3 += current_source
             else:
-                raise ValueError(f"未知类别标签: {label}")
+                s3 += current_source
         
         return mixed_wav, s1, s2, s3
 
