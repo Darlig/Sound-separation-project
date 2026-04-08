@@ -179,11 +179,12 @@ class RealTimeAudioSeparator:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--wav_path', type=str, default="./test_2mix_wavs/sample0/mixture.wav", help='Input wav file')
+    parser.add_argument('--wav_list', type=str, required=True, help='Text file with audio paths (uttid audio_path per line)')
     parser.add_argument('--ckpt_path', type=str, default="experiments/small_test_streaming_cpu/checkpoints/epoch=0-step=2.ckpt", help='Model checkpoint')
     parser.add_argument('--history_size', type=int, default=256, help='History buffer size (frames)')
     parser.add_argument('--chunk_size', type=int, default=32, help='Chunk size (frames)')
     parser.add_argument('--simulate_real_time', action='store_true', help='Simulate real-time with sleep')
+    parser.add_argument('--num_files', type=int, default=None, help='Number of files to test')
     
     args = parser.parse_args()
     
@@ -224,68 +225,110 @@ def main():
         device=device
     )
     
-    print(f"\nLoading audio file: {args.wav_path}")
-    fs_read, audio_data = wav.read(args.wav_path)
-    if audio_data.dtype != np.float32:
-        audio_data = audio_data.astype(np.float32) / np.iinfo(audio_data.dtype).max
-    if len(audio_data.shape) > 1:
-        audio_data = audio_data[:, 0]
+    wav_files = []
+    uttids = []
+    with open(args.wav_list, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split()
+            if len(parts) >= 2:
+                uttid = parts[0]
+                wav_path = ' '.join(parts[1:])
+                if os.path.exists(wav_path):
+                    uttids.append(uttid)
+                    wav_files.append(wav_path)
+                else:
+                    print(f"Warning: File not found: {wav_path}")
     
-    audio_duration = len(audio_data) / fs
-    print(f"Audio duration: {audio_duration:.2f} seconds")
+    if args.num_files is not None:
+        uttids = uttids[:args.num_files]
+        wav_files = wav_files[:args.num_files]
     
-    samples_per_chunk = args.chunk_size * 256
+    print(f"\nFound {len(wav_files)} audio files")
     
-    num_chunks = (len(audio_data) + samples_per_chunk - 1) // samples_per_chunk
-    print(f"Number of chunks: {num_chunks}")
+    all_chunk_times = []
+    all_first_chunk_latencies = []
+    all_rtfs = []
     
     print("\n" + "="*60)
     print("Running performance test...")
     print("="*60)
     
-    separator.reset()
-    
-    chunk_times = []
-    first_chunk_latency = None
-    
-    for chunk_idx in tqdm(range(num_chunks), desc="Processing chunks"):
-        start_idx = chunk_idx * samples_per_chunk
-        end_idx = min(start_idx + samples_per_chunk, len(audio_data))
-        chunk_data = audio_data[start_idx:end_idx]
+    for file_idx, wav_path in enumerate(tqdm(wav_files, desc="Processing files")):
+        separator.reset()
         
-        if args.simulate_real_time and chunk_idx > 0:
-            simulated_duration = len(chunk_data) / fs
-            time.sleep(simulated_duration * 0.9)
+        fs_read, audio_data = wav.read(wav_path)
+        if audio_data.dtype != np.float32:
+            audio_data = audio_data.astype(np.float32) / np.iinfo(audio_data.dtype).max
+        if len(audio_data.shape) > 1:
+            audio_data = audio_data[:, 0]
         
-        start_time = time.time()
+        audio_duration = len(audio_data) / fs
+        samples_per_chunk = args.chunk_size * 256
+        num_chunks = (len(audio_data) + samples_per_chunk - 1) // samples_per_chunk
         
-        speech, music, others = separator.process(chunk_data)
+        chunk_times = []
+        first_chunk_latency = None
         
-        end_time = time.time()
-        chunk_time = end_time - start_time
-        chunk_times.append(chunk_time)
+        for chunk_idx in range(num_chunks):
+            start_idx = chunk_idx * samples_per_chunk
+            end_idx = min(start_idx + samples_per_chunk, len(audio_data))
+            chunk_data = audio_data[start_idx:end_idx]
+            
+            if args.simulate_real_time and chunk_idx > 0:
+                simulated_duration = len(chunk_data) / fs
+                time.sleep(simulated_duration * 0.9)
+            
+            start_time = time.time()
+            
+            speech, music, others = separator.process(chunk_data)
+            
+            end_time = time.time()
+            chunk_time = end_time - start_time
+            chunk_times.append(chunk_time)
+            
+            if first_chunk_latency is None:
+                first_chunk_latency = chunk_time
         
-        if first_chunk_latency is None:
-            first_chunk_latency = chunk_time
-    
-    print("\n" + "="*60)
-    print("Performance Results")
-    print("="*60)
-    
-    if chunk_times:
-        avg_chunk_time = np.mean(chunk_times)
-        std_chunk_time = np.std(chunk_times)
-        max_chunk_time = np.max(chunk_times)
-        min_chunk_time = np.min(chunk_times)
+        all_chunk_times.extend(chunk_times)
+        all_first_chunk_latencies.append(first_chunk_latency)
         
         total_process_time = np.sum(chunk_times)
         rtf = total_process_time / audio_duration
+        all_rtfs.append(rtf)
+    
+    print("\n" + "="*60)
+    print("Performance Results (Aggregated)")
+    print("="*60)
+    
+    if all_chunk_times:
+        avg_chunk_time = np.mean(all_chunk_times)
+        std_chunk_time = np.std(all_chunk_times)
+        max_chunk_time = np.max(all_chunk_times)
+        min_chunk_time = np.min(all_chunk_times)
         
-        print(f"Audio duration: {audio_duration:.2f} s")
+        avg_first_latency = np.mean(all_first_chunk_latencies)
+        std_first_latency = np.std(all_first_chunk_latencies)
+        
+        avg_rtf = np.mean(all_rtfs)
+        std_rtf = np.std(all_rtfs)
+        
+        total_audio_duration = 0
+        for wav_path in wav_files:
+            fs_read, audio_data = wav.read(wav_path)
+            total_audio_duration += len(audio_data) / fs
+        
+        total_process_time = np.sum(all_chunk_times)
+        
+        print(f"Number of files: {len(wav_files)}")
+        print(f"Total audio duration: {total_audio_duration:.2f} s")
         print(f"Total processing time: {total_process_time:.4f} s")
-        print(f"RTF (Real-Time Factor): {rtf:.4f}")
         print()
-        print(f"First chunk latency: {first_chunk_latency*1000:.2f} ms")
+        print(f"Avg RTF (Real-Time Factor): {avg_rtf:.4f} +/- {std_rtf:.4f}")
+        print()
+        print(f"Avg first chunk latency: {avg_first_latency*1000:.2f} ms +/- {std_first_latency*1000:.2f} ms")
         print(f"Avg chunk time: {avg_chunk_time*1000:.2f} ms +/- {std_chunk_time*1000:.2f} ms")
         print(f"Min chunk time: {min_chunk_time*1000:.2f} ms")
         print(f"Max chunk time: {max_chunk_time*1000:.2f} ms")
