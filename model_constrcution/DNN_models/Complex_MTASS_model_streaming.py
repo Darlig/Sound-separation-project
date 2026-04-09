@@ -23,11 +23,12 @@ class ComplexMTASSLightningStreaming(pl.LightningModule):
 
         Z1, Z2, Z3 = self(X1)
 
-        loss, mse_loss, sisdr_loss = self.loss_wrapper.compute_out_cost(Z1, Z2, Z3, Y_targets, R_targets)
+        loss, mse_loss, sisdr_loss, l1_loss = self.loss_wrapper.compute_out_cost(Z1, Z2, Z3, Y_targets, R_targets)
 
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log('mse_loss', mse_loss, on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
         self.log('sisdr_loss', -sisdr_loss, on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
+        self.log('l1_loss', l1_loss, on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -38,11 +39,12 @@ class ComplexMTASSLightningStreaming(pl.LightningModule):
         
         with torch.no_grad():
             Z1, Z2, Z3 = self(X1)
-            loss, mse_loss, sisdr_loss = self.loss_wrapper.compute_out_cost(Z1, Z2, Z3, Y_targets, R_targets)
+            loss, mse_loss, sisdr_loss, l1_loss = self.loss_wrapper.compute_out_cost(Z1, Z2, Z3, Y_targets, R_targets)
         
         self.log('val_loss', loss, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log('val_mse_loss', mse_loss, on_epoch=True, prog_bar=False, sync_dist=True)
         self.log('val_sisdr_loss', -sisdr_loss, on_epoch=True, prog_bar=False, sync_dist=True)
+        self.log('val_l1_loss', l1_loss, on_epoch=True, prog_bar=False, sync_dist=True)
         return loss
 
     def configure_optimizers(self):

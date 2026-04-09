@@ -56,7 +56,8 @@ def main(args):
     model = ComplexMTASSLightning(
         learning_rate=args.lr,
         model_class=Complex_MTASS,
-        loss_class=Complex_MTASS_model
+        loss_class=Complex_MTASS_model,
+        use_l1_loss=args.use_l1_loss
     )
 
     checkpoint_callback = ModelCheckpoint(
@@ -105,6 +106,7 @@ if __name__ == '__main__':
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--n_workers', type=int, default=8)
     parser.add_argument('--gradient_clip', action='store_true', help="Enable gradient clipping")
+    parser.add_argument('--use_l1_loss', action='store_true', help="Enable L1 loss in addition to MSE and SI-SDR")
     parser.add_argument('--use_cuda', dest='use_cuda', action='store_true',
                         help="Whether to use cuda")
 
@@ -113,4 +115,3 @@ if __name__ == '__main__':
     os.makedirs(args.exp_dir, exist_ok=True)
     
     main(args)
-
