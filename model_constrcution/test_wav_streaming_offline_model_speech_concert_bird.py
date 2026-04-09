@@ -2,6 +2,8 @@
 import os
 import sys
 import argparse
+import csv
+import re
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -13,6 +15,50 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from DNN_models.Complex_MTASS_model import ComplexMTASSLightning
 from DNN_models.Complex_MTASS import Complex_MTASS
 from DNN_models.Complex_MTASS_Solver import Complex_MTASS_model
+
+
+def parse_csv_metadata(csv_path):
+    sample_category_counts = []
+
+    with open(csv_path, 'r', encoding='utf-8') as f:
+        reader = csv.reader(f, skipinitialspace=True)
+        next(reader)
+        for row in reader:
+            counts = {
+                'speech': 0,
+                'concert': 0,
+                'bird': 0,
+            }
+            for i in range(0, len(row), 3):
+                if i + 1 >= len(row):
+                    continue
+                label_lower = row[i + 1].lower()
+                if 'speech' in label_lower:
+                    counts['speech'] += 1
+                elif 'concert' in label_lower:
+                    counts['concert'] += 1
+                elif 'bird' in label_lower:
+                    counts['bird'] += 1
+                else:
+                    raise ValueError(f"Unknown category label in csv: {row[i + 1]}")
+            sample_category_counts.append(counts)
+
+    return sample_category_counts
+
+
+def get_sample_index(sample_name):
+    match = re.fullmatch(r'sample(\d+)', sample_name)
+    if match is None:
+        raise ValueError(
+            f"Sample directory name '{sample_name}' does not match expected format 'sample{{idx}}'"
+        )
+    return int(match.group(1))
+
+
+def print_bucket_stats(title, sdr_values, sisdr_values):
+    if sdr_values:
+        print(f"{title} SDR:     {np.mean(sdr_values):.2f} +/- {np.std(sdr_values):.2f}")
+        print(f"{title} SI-SDR:  {np.mean(sisdr_values):.2f} +/- {np.std(sisdr_values):.2f}")
 
 
 def sdr_cost(estimated, target, eps=1e-8):
@@ -272,6 +318,7 @@ def main():
     parser.add_argument('--wav_dir', type=str, required=True, help='Directory with test wav files')
     parser.add_argument('--ckpt_path', type=str, required=True, help='Path to Complex_MTASS checkpoint .ckpt')
     parser.add_argument('--output_dir', type=str, default='./wav_streaming_offline_model_results_speech_concert_bird', help='Folder to save results')
+    parser.add_argument('--csv_path', type=str, default=None, help='CSV metadata path generated for the wav samples')
     parser.add_argument('--use_cuda', action='store_true', default=True)
     parser.add_argument('--history_size', type=int, default=256, help='History buffer size (frames)')
     parser.add_argument('--chunk_size', type=int, default=32, help='Chunk size (frames)')
@@ -319,16 +366,36 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
 
+    sample_category_counts = None
+    if args.csv_path is not None:
+        sample_category_counts = parse_csv_metadata(args.csv_path)
+
     all_speech_sdr = []
     all_concert_sdr = []
     all_bird_sdr = []
     all_speech_sisdr = []
     all_concert_sisdr = []
     all_bird_sisdr = []
+    bucket_metrics = {
+        'speech_single': {'sdr': [], 'sisdr': []},
+        'speech_multi': {'sdr': [], 'sisdr': []},
+        'concert_single': {'sdr': [], 'sisdr': []},
+        'concert_multi': {'sdr': [], 'sisdr': []},
+        'bird_single': {'sdr': [], 'sisdr': []},
+        'bird_multi': {'sdr': [], 'sisdr': []},
+    }
 
     for sample_idx, sample_dir in enumerate(tqdm(sample_dirs, desc="Processing samples")):
         sample_name = os.path.basename(sample_dir)
         output_sample_dir = os.path.join(args.output_dir, sample_name)
+        category_counts = None
+        if sample_category_counts is not None:
+            csv_sample_idx = get_sample_index(sample_name)
+            if csv_sample_idx >= len(sample_category_counts):
+                raise IndexError(
+                    f"Sample index {csv_sample_idx} from '{sample_name}' exceeds csv size {len(sample_category_counts)}"
+                )
+            category_counts = sample_category_counts[csv_sample_idx]
 
         mixture_path = os.path.join(sample_dir, 'mixture.wav')
         speech_gt_path = os.path.join(sample_dir, 'speech_gt.wav')
@@ -357,6 +424,11 @@ def main():
             speech_sisdr = sisdr_cost(speech_es[:min_len], speech_gt[:min_len])
             all_speech_sdr.append(speech_sdr)
             all_speech_sisdr.append(speech_sisdr)
+            if category_counts is not None:
+                bucket_name = 'speech_single' if category_counts['speech'] == 1 else 'speech_multi'
+                if category_counts['speech'] >= 1:
+                    bucket_metrics[bucket_name]['sdr'].append(speech_sdr)
+                    bucket_metrics[bucket_name]['sisdr'].append(speech_sisdr)
 
         if valid_concert and concert_es is not None:
             min_len = min(len(concert_es), len(concert_gt))
@@ -364,6 +436,11 @@ def main():
             concert_sisdr = sisdr_cost(concert_es[:min_len], concert_gt[:min_len])
             all_concert_sdr.append(concert_sdr)
             all_concert_sisdr.append(concert_sisdr)
+            if category_counts is not None:
+                bucket_name = 'concert_single' if category_counts['concert'] == 1 else 'concert_multi'
+                if category_counts['concert'] >= 1:
+                    bucket_metrics[bucket_name]['sdr'].append(concert_sdr)
+                    bucket_metrics[bucket_name]['sisdr'].append(concert_sisdr)
 
         if valid_bird and bird_es is not None:
             min_len = min(len(bird_es), len(bird_gt))
@@ -371,22 +448,28 @@ def main():
             bird_sisdr = sisdr_cost(bird_es[:min_len], bird_gt[:min_len])
             all_bird_sdr.append(bird_sdr)
             all_bird_sisdr.append(bird_sisdr)
+            if category_counts is not None:
+                bucket_name = 'bird_single' if category_counts['bird'] == 1 else 'bird_multi'
+                if category_counts['bird'] >= 1:
+                    bucket_metrics[bucket_name]['sdr'].append(bird_sdr)
+                    bucket_metrics[bucket_name]['sisdr'].append(bird_sisdr)
 
     print("\n" + "=" * 60)
     print("SDR Statistics (Streaming with Complex_MTASS Offline Model):")
     print("=" * 60)
 
-    if all_speech_sdr:
-        print(f"Speech SDR:     {np.mean(all_speech_sdr):.2f} +/- {np.std(all_speech_sdr):.2f}")
-        print(f"Speech SI-SDR:  {np.mean(all_speech_sisdr):.2f} +/- {np.std(all_speech_sisdr):.2f}")
+    print_bucket_stats("Speech", all_speech_sdr, all_speech_sisdr)
+    print_bucket_stats("Concert", all_concert_sdr, all_concert_sisdr)
+    print_bucket_stats("Bird", all_bird_sdr, all_bird_sisdr)
 
-    if all_concert_sdr:
-        print(f"Concert SDR:    {np.mean(all_concert_sdr):.2f} +/- {np.std(all_concert_sdr):.2f}")
-        print(f"Concert SI-SDR: {np.mean(all_concert_sisdr):.2f} +/- {np.std(all_concert_sisdr):.2f}")
-
-    if all_bird_sdr:
-        print(f"Bird SDR:       {np.mean(all_bird_sdr):.2f} +/- {np.std(all_bird_sdr):.2f}")
-        print(f"Bird SI-SDR:    {np.mean(all_bird_sisdr):.2f} +/- {np.std(all_bird_sisdr):.2f}")
+    if sample_category_counts is not None:
+        print("\nCategory Count Breakdown:")
+        print_bucket_stats("Speech Single-Source", bucket_metrics['speech_single']['sdr'], bucket_metrics['speech_single']['sisdr'])
+        print_bucket_stats("Speech Multi-Source", bucket_metrics['speech_multi']['sdr'], bucket_metrics['speech_multi']['sisdr'])
+        print_bucket_stats("Concert Single-Source", bucket_metrics['concert_single']['sdr'], bucket_metrics['concert_single']['sisdr'])
+        print_bucket_stats("Concert Multi-Source", bucket_metrics['concert_multi']['sdr'], bucket_metrics['concert_multi']['sisdr'])
+        print_bucket_stats("Bird Single-Source", bucket_metrics['bird_single']['sdr'], bucket_metrics['bird_single']['sisdr'])
+        print_bucket_stats("Bird Multi-Source", bucket_metrics['bird_multi']['sdr'], bucket_metrics['bird_multi']['sisdr'])
 
     all_sdr = all_speech_sdr + all_concert_sdr + all_bird_sdr
     all_sisdr = all_speech_sisdr + all_concert_sisdr + all_bird_sisdr
