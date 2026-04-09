@@ -196,6 +196,7 @@ def print_bucket_stats(title, sdr_values, sisdr_values):
 def load_offline_model(ckpt_path, device):
     model = ComplexMTASSLightning.load_from_checkpoint(
         ckpt_path,
+        map_location=device,
         model_class=Complex_MTASS,
         loss_class=Complex_MTASS_model,
     )
