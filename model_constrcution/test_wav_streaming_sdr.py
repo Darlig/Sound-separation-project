@@ -71,8 +71,18 @@ class StreamingSTFT:
         num_new = len(new_samples)
         
         frames = []
+
+        if self.input_buffer.nonzero().numel() == 0 and num_new >= self.win_len:
+            first_win = new_samples[:self.win_len]
+            self.input_buffer = first_win
+            framed = self.input_buffer * self.window
+            spec = torch.fft.rfft(framed, n=self.fft_len)
+            frames.append(spec)
+            remaining_start = self.win_len
+        else:
+            remaining_start = 0
         
-        for i in range(0, num_new, self.win_inc):
+        for i in range(remaining_start, num_new, self.win_inc):
             chunk_end = min(i + self.win_inc, num_new)
             chunk = new_samples[i:chunk_end]
             
