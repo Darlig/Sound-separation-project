@@ -9,7 +9,10 @@ from tqdm import tqdm
 from wav_offline_eval_core import (
     collect_sample_dirs,
     get_existing_classes,
+    get_sample_index,
     load_offline_model,
+    parse_csv_metadata,
+    print_bucket_stats,
     print_category_stats,
     process_offline,
     sdr_cost,
@@ -22,7 +25,13 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--wav_dir', type=str, required=True, help='Directory with test wav samples')
     parser.add_argument('--ckpt_path', type=str, required=True, help='Path to model checkpoint .ckpt')
-    parser.add_argument('--output_dir', type=str, default='./wav_offline_results', help='Folder to save results')
+    parser.add_argument(
+        '--output_dir',
+        type=str,
+        default='./wav_offline_results_speech_concert_bird',
+        help='Folder to save results',
+    )
+    parser.add_argument('--csv_path', type=str, default=None, help='CSV metadata path generated for the wav samples')
     parser.add_argument('--use_cuda', action='store_true', default=True)
     parser.add_argument('--num_samples', type=int, default=None, help='Number of samples to test')
     parser.add_argument('--rename_output', action='store_true', default=True, help='Rename output dir with classes suffix')
@@ -31,16 +40,16 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    categories = ['speech', 'music', 'others']
+    categories = ['speech', 'concert', 'bird']
     gt_filename_map = {
         'speech': 'speech_gt.wav',
-        'music': 'music_gt.wav',
-        'others': 'others_gt.wav',
+        'concert': 'concert_gt.wav',
+        'bird': 'bird_gt.wav',
     }
     est_filename_map = {
         'speech': 'speech_es.wav',
-        'music': 'music_es.wav',
-        'others': 'others_es.wav',
+        'concert': 'concert_es.wav',
+        'bird': 'bird_es.wav',
     }
 
     device = torch.device("cuda" if args.use_cuda and torch.cuda.is_available() else "cpu")
@@ -53,7 +62,17 @@ def main():
     sample_dirs = collect_sample_dirs(args.wav_dir, args.num_samples)
     print(f"Found {len(sample_dirs)} samples")
 
+    sample_category_counts = None
+    if args.csv_path is not None:
+        sample_category_counts = parse_csv_metadata(args.csv_path, categories)
+
     all_metrics = {category: {'sdr': [], 'sisdr': []} for category in categories}
+    bucket_metrics = None
+    if sample_category_counts is not None:
+        bucket_metrics = {}
+        for category in categories:
+            bucket_metrics[f'{category}_single'] = {'sdr': [], 'sisdr': []}
+            bucket_metrics[f'{category}_multi'] = {'sdr': [], 'sisdr': []}
 
     win_len = 512
     win_inc = 256
@@ -74,6 +93,15 @@ def main():
         output_sample_dir = os.path.join(args.output_dir, output_sample_name)
         os.makedirs(output_sample_dir, exist_ok=True)
 
+        category_counts = None
+        if sample_category_counts is not None:
+            csv_sample_idx = get_sample_index(sample_name)
+            if csv_sample_idx >= len(sample_category_counts):
+                raise IndexError(
+                    f"Sample index {csv_sample_idx} from '{sample_name}' exceeds csv size {len(sample_category_counts)}"
+                )
+            category_counts = sample_category_counts[csv_sample_idx]
+
         results, fs = process_offline(
             model,
             mixture_path,
@@ -83,7 +111,7 @@ def main():
             win_len,
             win_inc,
             fft_len,
-            debug=True,
+            debug=False,
         )
 
         for category in categories:
@@ -97,14 +125,33 @@ def main():
                 all_metrics[category]['sisdr'].append(category_sisdr)
                 wav_write(estimate, output_sample_dir, est_filename_map[category], fs)
 
+                if category_counts is not None and category_counts[category] >= 1:
+                    bucket_name = f"{category}_single" if category_counts[category] == 1 else f"{category}_multi"
+                    bucket_metrics[bucket_name]['sdr'].append(category_sdr)
+                    bucket_metrics[bucket_name]['sisdr'].append(category_sisdr)
+
         wav_write(results['mixture'], output_sample_dir, 'mixture.wav', fs)
 
     print("\n" + "=" * 60)
-    print("SDR Statistics (Offline):")
+    print("SDR Statistics (Offline, Speech/Concert/Bird):")
     print("=" * 60)
 
     for category in categories:
         print_category_stats(category.capitalize(), all_metrics[category]['sdr'], all_metrics[category]['sisdr'])
+
+    if bucket_metrics is not None:
+        print("\nCategory Count Breakdown:")
+        for category in categories:
+            print_bucket_stats(
+                f"{category.capitalize()} Single-Source",
+                bucket_metrics[f'{category}_single']['sdr'],
+                bucket_metrics[f'{category}_single']['sisdr'],
+            )
+            print_bucket_stats(
+                f"{category.capitalize()} Multi-Source",
+                bucket_metrics[f'{category}_multi']['sdr'],
+                bucket_metrics[f'{category}_multi']['sisdr'],
+            )
 
     all_sdr = []
     all_sisdr = []
