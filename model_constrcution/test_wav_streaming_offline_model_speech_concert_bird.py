@@ -285,6 +285,7 @@ def main():
     print("Loading model...")
     model = ComplexMTASSLightning.load_from_checkpoint(
         args.ckpt_path,
+        map_location=device,
         model_class=Complex_MTASS,
         loss_class=Complex_MTASS_model,
     )
