@@ -107,33 +107,53 @@ class Complex_MTASS_model:
         mask_float = mask.float()  
         return loss_vector, mask_float
   
-    def compute_out_cost(Z1, Z2, Z3, Y_targets, R_targets, use_l1_loss=False):
+    def compute_out_cost(
+        Z1,
+        Z2,
+        Z3,
+        Y_targets,
+        R_targets,
+        mse_loss_weight=1.0,
+        sisdr_loss_weight=1.0,
+        l1_loss_weight=0.0,
+    ):
         ### START CODE HERE ###
-        win_len = 512
-        win_inc = 256 # frame shift
-        fft_len = 512
-        Z1_time = Complex_MTASS_model.Inverse_STFT(Z1, win_len, win_inc, fft_len)
-        Z2_time = Complex_MTASS_model.Inverse_STFT(Z2, win_len, win_inc, fft_len)
-        Z3_time = Complex_MTASS_model.Inverse_STFT(Z3, win_len, win_inc, fft_len)
         Y1, Y2, Y3 = Y_targets[0], Y_targets[1], Y_targets[2]
-        R1, R2, R3 = R_targets[0], R_targets[1], R_targets[2]
-        
-        mse_cost = torch.nn.MSELoss()
-        l1_cost = torch.nn.L1Loss()
-        cost_freq = mse_cost(Z1, Y1) + mse_cost(Z2, Y2) + mse_cost(Z3, Y3)
         cost_l1 = torch.zeros((), device=Z1.device, dtype=Z1.dtype)
-        if use_l1_loss:
+        cost_freq = torch.zeros((), device=Z1.device, dtype=Z1.dtype)
+        cost_time_sisdr = torch.zeros((), device=Z1.device, dtype=Z1.dtype)
+
+        if mse_loss_weight != 0:
+            mse_cost = torch.nn.MSELoss()
+            cost_freq = mse_cost(Z1, Y1) + mse_cost(Z2, Y2) + mse_cost(Z3, Y3)
+
+        if l1_loss_weight != 0:
+            l1_cost = torch.nn.L1Loss()
             cost_l1 = l1_cost(Z1, Y1) + l1_cost(Z2, Y2) + l1_cost(Z3, Y3)
 
-        loss_s, mask_s = Complex_MTASS_model.masked_sisdr_loss(Z1_time, R1)
-        loss_m, mask_m = Complex_MTASS_model.masked_sisdr_loss(Z2_time, R2)
-        loss_o, mask_o = Complex_MTASS_model.masked_sisdr_loss(Z3_time, R3)
-        sum_loss = loss_s + loss_m + loss_o
-        num_tasks = mask_s + mask_m + mask_o
-        num_tasks = torch.clamp(num_tasks, min=1.0)
-        per_sample_loss = sum_loss / num_tasks
-        cost_time_sisdr = torch.mean(per_sample_loss)
-        total_cost = cost_freq + cost_time_sisdr + cost_l1
+        if sisdr_loss_weight != 0:
+            win_len = 512
+            win_inc = 256 # frame shift
+            fft_len = 512
+            Z1_time = Complex_MTASS_model.Inverse_STFT(Z1, win_len, win_inc, fft_len)
+            Z2_time = Complex_MTASS_model.Inverse_STFT(Z2, win_len, win_inc, fft_len)
+            Z3_time = Complex_MTASS_model.Inverse_STFT(Z3, win_len, win_inc, fft_len)
+            R1, R2, R3 = R_targets[0], R_targets[1], R_targets[2]
+
+            loss_s, mask_s = Complex_MTASS_model.masked_sisdr_loss(Z1_time, R1)
+            loss_m, mask_m = Complex_MTASS_model.masked_sisdr_loss(Z2_time, R2)
+            loss_o, mask_o = Complex_MTASS_model.masked_sisdr_loss(Z3_time, R3)
+            sum_loss = loss_s + loss_m + loss_o
+            num_tasks = mask_s + mask_m + mask_o
+            num_tasks = torch.clamp(num_tasks, min=1.0)
+            per_sample_loss = sum_loss / num_tasks
+            cost_time_sisdr = torch.mean(per_sample_loss)
+
+        total_cost = (
+            mse_loss_weight * cost_freq
+            + sisdr_loss_weight * cost_time_sisdr
+            + l1_loss_weight * cost_l1
+        )
 
         return total_cost, cost_freq, cost_time_sisdr, cost_l1
 
