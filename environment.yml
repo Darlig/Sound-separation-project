@@ -1,4 +1,4 @@
-name: multi_head
+name: audio_sep_multi_head
 channels:
   - defaults
 dependencies:
