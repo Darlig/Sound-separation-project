@@ -52,6 +52,10 @@ class ComplexMTASSLightning(pl.LightningModule):
         self.log('val_l1_loss', l1_loss, on_epoch=True, prog_bar=False, sync_dist=True)
         return loss
 
+    def on_before_optimizer_step(self, optimizer):
+        grad_norm = self._compute_grad_norm()
+        self.log('grad_norm', grad_norm, on_step=True, on_epoch=False, prog_bar=False, sync_dist=False)
+
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
         schedular = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2,
@@ -64,3 +68,12 @@ class ComplexMTASSLightning(pl.LightningModule):
                 "monitor": "val_loss"
             },
         }
+
+    def _compute_grad_norm(self):
+        grad_norm_sq = torch.zeros((), device=self.device)
+        for param in self.parameters():
+            if param.grad is None:
+                continue
+            param_grad_norm = torch.norm(param.grad.detach(), p=2)
+            grad_norm_sq = grad_norm_sq + param_grad_norm.pow(2)
+        return torch.sqrt(grad_norm_sq)
