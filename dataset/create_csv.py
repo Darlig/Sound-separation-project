@@ -2,6 +2,7 @@ import pandas as pd
 import random
 import argparse
 from pathlib import Path
+import os
 
 def load_original_csv(csv_path):
     #df = pd.read_csv(csv_path)
@@ -69,8 +70,15 @@ def generate_mixed_csv(original_df, output_csv, num_samples, num_sources):
         
         for _, sample in selected_samples.iterrows():
             filename = sample['filename']
-            wav_filename = filename.replace('.mp4', '.wav')
-            audio_path = f"/work107/luoxiaoxue/data/VGGSound/audios_16k/{wav_filename}"
+            #print(filename)
+            #exit()
+            if os.path.exists(filename):
+                #print(filename)
+                #exit()
+                audio_path = filename
+            else:
+                wav_filename = filename.replace('.mp4', '.wav')
+                audio_path = f"/work107/luoxiaoxue/data/VGGSound/audios_16k/{wav_filename}"
             category = sample['category']
             
             snr_range = [-3.0, 3.0]

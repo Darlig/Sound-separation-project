@@ -1,14 +1,15 @@
+
 import os
 import argparse
 import torch
 import h5py
 import pytorch_lightning as pl
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
 
-from DNN_models.Complex_MTASS_model import ComplexMTASSLightning
-from DNN_models.Complex_MTASS import *
+from DNN_models.Complex_MTASS_model_streaming import ComplexMTASSLightningStreaming
+from DNN_models.Complex_MTASS_streaming import *
 from DNN_models.Complex_MTASS_Solver import *
 
 class HDF5Dataset(Dataset):
@@ -37,11 +38,6 @@ class HDF5Dataset(Dataset):
 
 def main(args):
     pl.seed_everything(42)
-    l1_loss_weight = args.l1_loss_weight
-    if l1_loss_weight is None:
-        l1_loss_weight = 1.0 if args.use_l1_loss else 0.0
-
-    # Load dataset
     data_train = HDF5Dataset(args.train_h5)
     data_val = HDF5Dataset(args.val_h5)
     train_loader = DataLoader(data_train,
@@ -57,13 +53,11 @@ def main(args):
                             pin_memory=True,
                             drop_last=True)
     
-    model = ComplexMTASSLightning(
+    model = ComplexMTASSLightningStreaming(
         learning_rate=args.lr,
-        model_class=Complex_MTASS,
+        model_class=Complex_MTASS_Streaming,
         loss_class=Complex_MTASS_model,
-        mse_loss_weight=args.mse_loss_weight,
-        sisdr_loss_weight=args.sisdr_loss_weight,
-        l1_loss_weight=l1_loss_weight
+        is_causal=True
     )
 
     checkpoint_callback = ModelCheckpoint(
@@ -82,13 +76,12 @@ def main(args):
         devices=args.gpus if args.use_cuda else "auto",
         accelerator="gpu" if args.use_cuda else "cpu",
         benchmark=True,
-        strategy="ddp",
+        strategy="ddp" if args.use_cuda else "auto",
         max_epochs=args.epochs,
         logger=logger,
         callbacks=[checkpoint_callback],
         gradient_clip_val=20.0 if args.gradient_clip else 0.0,
         precision='32',
-        #log_every_n_steps=10,
     )
 
     ckpt_path = None
@@ -100,7 +93,7 @@ def main(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('exp_dir', type=str, default='./model_parameters')
+    parser.add_argument('exp_dir', type=str, default='./model_parameters_streaming')
     parser.add_argument('--train_h5', type=str, default='/ssd2.m2/sound/VGGSound/imagebind/train_ready.h5')
     parser.add_argument('--val_h5', type=str, default='/ssd2.m2/sound/VGGSound/imagebind/dev_ready.h5')
     parser.add_argument('--resume_ckpt', type=str, default=None, help="Path to .ckpt to continue training")
@@ -112,14 +105,14 @@ if __name__ == '__main__':
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--n_workers', type=int, default=8)
     parser.add_argument('--gradient_clip', action='store_true', help="Enable gradient clipping")
-    parser.add_argument('--mse_loss_weight', type=float, default=1.0, help="Weight for MSE loss; 0 disables it")
-    parser.add_argument('--sisdr_loss_weight', type=float, default=1.0, help="Weight for SI-SDR loss; 0 disables it")
-    parser.add_argument('--l1_loss_weight', type=float, default=None, help="Weight for L1 loss; 0 disables it")
-    parser.add_argument('--use_l1_loss', action='store_true', help="Deprecated compatibility flag; enables L1 with weight 1.0 if --l1_loss_weight is not set")
     parser.add_argument('--use_cuda', dest='use_cuda', action='store_true',
                         help="Whether to use cuda")
 
     args = parser.parse_args()
+
+    # Auto-enable CUDA if GPUs are specified
+    if args.gpus is not None:
+        args.use_cuda = True
 
     os.makedirs(args.exp_dir, exist_ok=True)
     

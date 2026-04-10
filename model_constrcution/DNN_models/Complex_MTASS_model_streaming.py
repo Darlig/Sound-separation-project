@@ -1,26 +1,17 @@
+
+
 import torch
 import pytorch_lightning as pl
-from DNN_models.Complex_MTASS import *
+from DNN_models.Complex_MTASS_streaming import *
 from DNN_models.Complex_MTASS_Solver import *
 
-class ComplexMTASSLightning(pl.LightningModule):
-    def __init__(
-        self,
-        learning_rate,
-        model_class,
-        loss_class,
-        mse_loss_weight=1.0,
-        sisdr_loss_weight=1.0,
-        l1_loss_weight=0.0,
-    ):
+class ComplexMTASSLightningStreaming(pl.LightningModule):
+    def __init__(self, learning_rate, model_class, loss_class, is_causal=True):
         super().__init__()
         self.save_hyperparameters(ignore=['model_class', 'loss_class'])
-        self.model = model_class()
+        self.model = model_class(is_causal=is_causal)
         self.loss_wrapper = loss_class
         self.learning_rate = learning_rate
-        self.mse_loss_weight = mse_loss_weight
-        self.sisdr_loss_weight = sisdr_loss_weight
-        self.l1_loss_weight = l1_loss_weight
 
     def forward(self, x):
         return self.model(x)
@@ -32,17 +23,7 @@ class ComplexMTASSLightning(pl.LightningModule):
 
         Z1, Z2, Z3 = self(X1)
 
-        loss, mse_loss, sisdr_loss, l1_loss = self.loss_wrapper.compute_out_cost(
-            Z1,
-            Z2,
-            Z3,
-            Y_targets,
-            R_targets,
-            mse_loss_weight=self.mse_loss_weight,
-            sisdr_loss_weight=self.sisdr_loss_weight,
-            l1_loss_weight=self.l1_loss_weight,
-        )
-        #loss = self.loss_wrapper.compute_out_cost(Z1, Z2, Z3, Y_targets, R_targets)
+        loss, mse_loss, sisdr_loss, l1_loss = self.loss_wrapper.compute_out_cost(Z1, Z2, Z3, Y_targets, R_targets)
 
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log('mse_loss', mse_loss, on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
@@ -58,17 +39,7 @@ class ComplexMTASSLightning(pl.LightningModule):
         
         with torch.no_grad():
             Z1, Z2, Z3 = self(X1)
-            loss, mse_loss, sisdr_loss, l1_loss = self.loss_wrapper.compute_out_cost(
-                Z1,
-                Z2,
-                Z3,
-                Y_targets,
-                R_targets,
-                mse_loss_weight=self.mse_loss_weight,
-                sisdr_loss_weight=self.sisdr_loss_weight,
-                l1_loss_weight=self.l1_loss_weight,
-            )
-            #loss = self.loss_wrapper.compute_out_cost(Z1, Z2, Z3, Y_targets, R_targets)
+            loss, mse_loss, sisdr_loss, l1_loss = self.loss_wrapper.compute_out_cost(Z1, Z2, Z3, Y_targets, R_targets)
         
         self.log('val_loss', loss, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log('val_mse_loss', mse_loss, on_epoch=True, prog_bar=False, sync_dist=True)
