@@ -116,10 +116,12 @@ class Complex_MTASS_model:
         mse_loss_weight=1.0,
         sisdr_loss_weight=1.0,
         l1_loss_weight=0.0,
+        magnitude_l1_loss_weight=0.0,
     ):
         ### START CODE HERE ###
         Y1, Y2, Y3 = Y_targets[0], Y_targets[1], Y_targets[2]
         cost_l1 = torch.zeros((), device=Z1.device, dtype=Z1.dtype)
+        cost_magnitude_l1 = torch.zeros((), device=Z1.device, dtype=Z1.dtype)
         cost_freq = torch.zeros((), device=Z1.device, dtype=Z1.dtype)
         cost_time_sisdr = torch.zeros((), device=Z1.device, dtype=Z1.dtype)
 
@@ -130,6 +132,14 @@ class Complex_MTASS_model:
         if l1_loss_weight != 0:
             l1_cost = torch.nn.L1Loss()
             cost_l1 = l1_cost(Z1, Y1) + l1_cost(Z2, Y2) + l1_cost(Z3, Y3)
+
+        if magnitude_l1_loss_weight != 0:
+            l1_cost = torch.nn.L1Loss()
+            cost_magnitude_l1 = (
+                l1_cost(torch.norm(Z1, dim=1), torch.norm(Y1, dim=1))
+                + l1_cost(torch.norm(Z2, dim=1), torch.norm(Y2, dim=1))
+                + l1_cost(torch.norm(Z3, dim=1), torch.norm(Y3, dim=1))
+            )
 
         if sisdr_loss_weight != 0:
             win_len = 512
@@ -153,9 +163,10 @@ class Complex_MTASS_model:
             mse_loss_weight * cost_freq
             + sisdr_loss_weight * cost_time_sisdr
             + l1_loss_weight * cost_l1
+            + magnitude_l1_loss_weight * cost_magnitude_l1
         )
 
-        return total_cost, cost_freq, cost_time_sisdr, cost_l1
+        return total_cost, cost_freq, cost_time_sisdr, cost_l1, cost_magnitude_l1
 
     def sisdr_cost(estimated, target, eps=1e-8):
         dot = torch.sum(estimated * target, dim=-1, keepdim=True)
