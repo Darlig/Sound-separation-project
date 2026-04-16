@@ -25,6 +25,17 @@ class ComplexMTASSLightning(pl.LightningModule):
     def forward(self, x):
         return self.model(x)
 
+    def reset_streaming_state(self):
+        reset_fn = getattr(self.model, 'reset_streaming_state', None)
+        if callable(reset_fn):
+            reset_fn()
+
+    def forward_streaming(self, x):
+        stream_fn = getattr(self.model, 'forward_streaming', None)
+        if not callable(stream_fn):
+            raise AttributeError('Underlying model does not implement forward_streaming().')
+        return stream_fn(x)
+
     def training_step(self, batch, batch_idx):
         X1 = batch[0]
         Y_targets = batch[1:4]

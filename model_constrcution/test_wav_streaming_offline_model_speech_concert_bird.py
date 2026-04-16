@@ -5,7 +5,6 @@ import argparse
 import csv
 import re
 import torch
-import torch.nn.functional as F
 import numpy as np
 import scipy.io.wavfile as wav
 from tqdm import tqdm
@@ -179,10 +178,19 @@ class StreamingISTFT:
             return torch.cat(output_samples, dim=0).cpu().numpy()
         return None
 
+    def flush(self):
+        if self.prev_samples.numel() == 0:
+            return None
+
+        tail = self.prev_samples.clone()
+        self.prev_samples.zero_()
+        self.output_buffer.zero_()
+        return tail.cpu().numpy()
+
 
 class RealTimeAudioSeparator:
     def __init__(self, model, win_len=512, win_inc=256, fft_len=512,
-                 history_size=256, chunk_size=32, device='cpu'):
+                 chunk_size=32, device='cpu'):
         self.model = model
         self.model.eval()
         self.device = device
@@ -190,7 +198,6 @@ class RealTimeAudioSeparator:
         self.win_len = win_len
         self.win_inc = win_inc
         self.fft_len = fft_len
-        self.history_size = history_size
         self.chunk_size = chunk_size
 
         self.stft = StreamingSTFT(win_len, win_inc, fft_len, device)
@@ -198,37 +205,26 @@ class RealTimeAudioSeparator:
         self.istft_concert = StreamingISTFT(win_len, win_inc, fft_len, device)
         self.istft_bird = StreamingISTFT(win_len, win_inc, fft_len, device)
 
-        self.spec_buffer = None
-
     def reset(self):
         self.stft.reset()
         self.istft_speech.reset()
         self.istft_concert.reset()
         self.istft_bird.reset()
-        self.spec_buffer = None
-
-    def _init_spec_buffer(self, first_spec):
-        pad_size = self.history_size - first_spec.shape[-1]
-        if pad_size > 0:
-            padded = F.pad(first_spec, (pad_size, 0))
-            self.spec_buffer = padded
-        else:
-            self.spec_buffer = first_spec[..., -self.history_size:]
+        reset_fn = getattr(self.model, 'reset_streaming_state', None)
+        if callable(reset_fn):
+            reset_fn()
 
     def _process_spec_chunk(self, new_spec):
-        if self.spec_buffer is None:
-            self._init_spec_buffer(new_spec)
-        else:
-            self.spec_buffer = torch.cat(
-                [self.spec_buffer, new_spec], dim=-1
-            )[..., -self.history_size:]
-
         with torch.no_grad():
-            z1, z2, z3 = self.model(self.spec_buffer.unsqueeze(0))
+            stream_fn = getattr(self.model, 'forward_streaming', None)
+            if callable(stream_fn):
+                z1, z2, z3 = stream_fn(new_spec.unsqueeze(0))
+            else:
+                z1, z2, z3 = self.model(new_spec.unsqueeze(0))
 
-        out1 = z1[..., -new_spec.shape[-1]:].squeeze(0)
-        out2 = z2[..., -new_spec.shape[-1]:].squeeze(0)
-        out3 = z3[..., -new_spec.shape[-1]:].squeeze(0)
+        out1 = z1.squeeze(0)
+        out2 = z2.squeeze(0)
+        out3 = z3.squeeze(0)
 
         return out1, out2, out3
 
@@ -291,6 +287,17 @@ class RealTimeAudioSeparator:
             if bird is not None:
                 bird_output.append(bird)
 
+        speech_tail = self.istft_speech.flush()
+        concert_tail = self.istft_concert.flush()
+        bird_tail = self.istft_bird.flush()
+
+        if speech_tail is not None:
+            speech_output.append(speech_tail)
+        if concert_tail is not None:
+            concert_output.append(concert_tail)
+        if bird_tail is not None:
+            bird_output.append(bird_tail)
+
         speech_out = None
         concert_out = None
         bird_out = None
@@ -320,7 +327,6 @@ def main():
     parser.add_argument('--output_dir', type=str, default='./wav_streaming_offline_model_results_speech_concert_bird', help='Folder to save results')
     parser.add_argument('--csv_path', type=str, default=None, help='CSV metadata path generated for the wav samples')
     parser.add_argument('--use_cuda', action='store_true', default=True)
-    parser.add_argument('--history_size', type=int, default=256, help='History buffer size (frames)')
     parser.add_argument('--chunk_size', type=int, default=32, help='Chunk size (frames)')
     parser.add_argument('--num_samples', type=int, default=None, help='Number of samples to test')
 
@@ -346,7 +352,6 @@ def main():
         win_len=512,
         win_inc=256,
         fft_len=512,
-        history_size=args.history_size,
         chunk_size=args.chunk_size,
         device=device
     )
