@@ -14,15 +14,22 @@ EPS = 1e-12
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Traverse an inference-result directory and compute global RMS(es)/RMS(gt) "
-            "statistics for speech, concert, and bird."
+            "Compute global RMS(es)/RMS(gt) statistics for speech, concert, and bird "
+            "by reading GT audio from a reference input directory and estimated audio "
+            "from an inference output directory."
         )
     )
     parser.add_argument(
-        "--input_dir",
+        "--inference_input_dir",
         type=str,
         required=True,
-        help="Root directory containing sample subdirectories",
+        help="Reference sample root directory containing GT wav files",
+    )
+    parser.add_argument(
+        "--inference_output_dir",
+        type=str,
+        required=True,
+        help="Inference result root directory containing sample subdirectories",
     )
     parser.add_argument(
         "--save_csv",
@@ -77,38 +84,53 @@ def ratio_to_db(ratio):
 def main():
     args = parse_args()
 
-    if not os.path.isdir(args.input_dir):
-        raise FileNotFoundError(f"input_dir does not exist: {args.input_dir}")
+    if not os.path.isdir(args.inference_input_dir):
+        raise FileNotFoundError(
+            f"inference_input_dir does not exist: {args.inference_input_dir}"
+        )
 
-    sample_dirs = sorted(
-        os.path.join(args.input_dir, item)
-        for item in os.listdir(args.input_dir)
-        if os.path.isdir(os.path.join(args.input_dir, item))
+    if not os.path.isdir(args.inference_output_dir):
+        raise FileNotFoundError(
+            f"inference_output_dir does not exist: {args.inference_output_dir}"
+        )
+
+    sample_names = sorted(
+        item
+        for item in os.listdir(args.inference_output_dir)
+        if os.path.isdir(os.path.join(args.inference_output_dir, item))
     )
 
     global_ratios = {category: [] for category in CATEGORIES}
     csv_rows = []
     total_samples = 0
     skipped_missing_mixture = 0
+    missing_input_sample_dirs = 0
     skipped_missing_files = {category: 0 for category in CATEGORIES}
     skipped_zero_gt = {category: 0 for category in CATEGORIES}
     skipped_empty_audio = {category: 0 for category in CATEGORIES}
     sample_rate_mismatch = {category: 0 for category in CATEGORIES}
 
-    for sample_dir in sample_dirs:
-        sample_name = os.path.basename(sample_dir)
+    for sample_name in sample_names:
+        input_sample_dir = os.path.join(args.inference_input_dir, sample_name)
+        output_sample_dir = os.path.join(args.inference_output_dir, sample_name)
         total_samples += 1
 
-        mixture_path = os.path.join(sample_dir, "mixture.wav")
+        mixture_path = os.path.join(output_sample_dir, "mixture.wav")
         if not os.path.exists(mixture_path):
             skipped_missing_mixture += 1
             if args.verbose:
-                print(f"[skip sample] {sample_name}: missing mixture.wav")
+                print(f"[skip sample] {sample_name}: missing output mixture.wav")
+            continue
+
+        if not os.path.isdir(input_sample_dir):
+            missing_input_sample_dirs += 1
+            if args.verbose:
+                print(f"[skip sample] {sample_name}: missing input sample dir")
             continue
 
         for category in CATEGORIES:
-            gt_path = os.path.join(sample_dir, f"{category}_gt.wav")
-            es_path = os.path.join(sample_dir, f"{category}_es.wav")
+            gt_path = os.path.join(input_sample_dir, f"{category}_gt.wav")
+            es_path = os.path.join(output_sample_dir, f"{category}_es.wav")
 
             if not os.path.exists(gt_path) or not os.path.exists(es_path):
                 skipped_missing_files[category] += 1
@@ -165,9 +187,11 @@ def main():
     print("=" * 72)
     print("ES/GT RMS Ratio Statistics")
     print("=" * 72)
-    print(f"Input dir: {args.input_dir}")
-    print(f"Sample directories scanned: {total_samples}")
-    print(f"Samples skipped for missing mixture.wav: {skipped_missing_mixture}")
+    print(f"Reference input dir: {args.inference_input_dir}")
+    print(f"Inference output dir: {args.inference_output_dir}")
+    print(f"Output sample directories scanned: {total_samples}")
+    print(f"Samples skipped for missing output mixture.wav: {skipped_missing_mixture}")
+    print(f"Samples skipped for missing input sample dir: {missing_input_sample_dirs}")
     print()
 
     for category in CATEGORIES:
