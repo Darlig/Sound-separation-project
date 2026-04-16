@@ -103,7 +103,6 @@ def main():
     global_ratios = {category: [] for category in CATEGORIES}
     csv_rows = []
     total_samples = 0
-    skipped_missing_mixture = 0
     missing_input_sample_dirs = 0
     skipped_missing_files = {category: 0 for category in CATEGORIES}
     skipped_zero_gt = {category: 0 for category in CATEGORIES}
@@ -114,13 +113,6 @@ def main():
         input_sample_dir = os.path.join(args.inference_input_dir, sample_name)
         output_sample_dir = os.path.join(args.inference_output_dir, sample_name)
         total_samples += 1
-
-        mixture_path = os.path.join(output_sample_dir, "mixture.wav")
-        if not os.path.exists(mixture_path):
-            skipped_missing_mixture += 1
-            if args.verbose:
-                print(f"[skip sample] {sample_name}: missing output mixture.wav")
-            continue
 
         if not os.path.isdir(input_sample_dir):
             missing_input_sample_dirs += 1
@@ -190,7 +182,6 @@ def main():
     print(f"Reference input dir: {args.inference_input_dir}")
     print(f"Inference output dir: {args.inference_output_dir}")
     print(f"Output sample directories scanned: {total_samples}")
-    print(f"Samples skipped for missing output mixture.wav: {skipped_missing_mixture}")
     print(f"Samples skipped for missing input sample dir: {missing_input_sample_dirs}")
     print()
 
