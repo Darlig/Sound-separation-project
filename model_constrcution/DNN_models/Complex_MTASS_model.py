@@ -12,6 +12,7 @@ class ComplexMTASSLightning(pl.LightningModule):
         mse_loss_weight=1.0,
         sisdr_loss_weight=1.0,
         l1_loss_weight=0.0,
+        magnitude_l1_loss_weight=0.0,
     ):
         super().__init__()
         self.save_hyperparameters(ignore=['model_class', 'loss_class'])
@@ -21,6 +22,7 @@ class ComplexMTASSLightning(pl.LightningModule):
         self.mse_loss_weight = mse_loss_weight
         self.sisdr_loss_weight = sisdr_loss_weight
         self.l1_loss_weight = l1_loss_weight
+        self.magnitude_l1_loss_weight = magnitude_l1_loss_weight
 
     def forward(self, x):
         return self.model(x)
@@ -43,7 +45,7 @@ class ComplexMTASSLightning(pl.LightningModule):
 
         Z1, Z2, Z3 = self(X1)
 
-        loss, mse_loss, sisdr_loss, l1_loss = self.loss_wrapper.compute_out_cost(
+        loss, mse_loss, sisdr_loss, l1_loss, magnitude_l1_loss = self.loss_wrapper.compute_out_cost(
             Z1,
             Z2,
             Z3,
@@ -52,6 +54,7 @@ class ComplexMTASSLightning(pl.LightningModule):
             mse_loss_weight=self.mse_loss_weight,
             sisdr_loss_weight=self.sisdr_loss_weight,
             l1_loss_weight=self.l1_loss_weight,
+            magnitude_l1_loss_weight=self.magnitude_l1_loss_weight,
         )
         #loss = self.loss_wrapper.compute_out_cost(Z1, Z2, Z3, Y_targets, R_targets)
 
@@ -59,6 +62,7 @@ class ComplexMTASSLightning(pl.LightningModule):
         self.log('mse_loss', mse_loss, on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
         self.log('sisdr_loss', -sisdr_loss, on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
         self.log('l1_loss', l1_loss, on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
+        self.log('magnitude_l1_loss', magnitude_l1_loss, on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -69,7 +73,7 @@ class ComplexMTASSLightning(pl.LightningModule):
         
         with torch.no_grad():
             Z1, Z2, Z3 = self(X1)
-            loss, mse_loss, sisdr_loss, l1_loss = self.loss_wrapper.compute_out_cost(
+            loss, mse_loss, sisdr_loss, l1_loss, magnitude_l1_loss = self.loss_wrapper.compute_out_cost(
                 Z1,
                 Z2,
                 Z3,
@@ -78,6 +82,7 @@ class ComplexMTASSLightning(pl.LightningModule):
                 mse_loss_weight=self.mse_loss_weight,
                 sisdr_loss_weight=self.sisdr_loss_weight,
                 l1_loss_weight=self.l1_loss_weight,
+                magnitude_l1_loss_weight=self.magnitude_l1_loss_weight,
             )
             #loss = self.loss_wrapper.compute_out_cost(Z1, Z2, Z3, Y_targets, R_targets)
         
@@ -85,6 +90,7 @@ class ComplexMTASSLightning(pl.LightningModule):
         self.log('val_mse_loss', mse_loss, on_epoch=True, prog_bar=False, sync_dist=True)
         self.log('val_sisdr_loss', -sisdr_loss, on_epoch=True, prog_bar=False, sync_dist=True)
         self.log('val_l1_loss', l1_loss, on_epoch=True, prog_bar=False, sync_dist=True)
+        self.log('val_magnitude_l1_loss', magnitude_l1_loss, on_epoch=True, prog_bar=False, sync_dist=True)
         return loss
 
     def on_before_optimizer_step(self, optimizer):

@@ -38,6 +38,10 @@ class HDF5Dataset(Dataset):
 
 def main(args):
     pl.seed_everything(42)
+    l1_loss_weight = args.l1_loss_weight
+    if l1_loss_weight is None:
+        l1_loss_weight = 1.0 if args.use_l1_loss else 0.0
+
     data_train = HDF5Dataset(args.train_h5)
     data_val = HDF5Dataset(args.val_h5)
     train_loader = DataLoader(data_train,
@@ -57,7 +61,11 @@ def main(args):
         learning_rate=args.lr,
         model_class=Complex_MTASS_Streaming,
         loss_class=Complex_MTASS_model,
-        is_causal=True
+        is_causal=True,
+        mse_loss_weight=args.mse_loss_weight,
+        sisdr_loss_weight=args.sisdr_loss_weight,
+        l1_loss_weight=l1_loss_weight,
+        magnitude_l1_loss_weight=args.magnitude_l1_loss_weight,
     )
 
     checkpoint_callback = ModelCheckpoint(
@@ -105,6 +113,11 @@ if __name__ == '__main__':
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--n_workers', type=int, default=8)
     parser.add_argument('--gradient_clip', action='store_true', help="Enable gradient clipping")
+    parser.add_argument('--mse_loss_weight', type=float, default=1.0, help="Weight for MSE loss; 0 disables it")
+    parser.add_argument('--sisdr_loss_weight', type=float, default=1.0, help="Weight for SI-SDR loss; 0 disables it")
+    parser.add_argument('--l1_loss_weight', type=float, default=None, help="Weight for L1 loss; 0 disables it")
+    parser.add_argument('--magnitude_l1_loss_weight', type=float, default=0.0, help="Weight for magnitude L1 loss; 0 disables it")
+    parser.add_argument('--use_l1_loss', action='store_true', help="Deprecated compatibility flag; enables L1 with weight 1.0 if --l1_loss_weight is not set")
     parser.add_argument('--use_cuda', dest='use_cuda', action='store_true',
                         help="Whether to use cuda")
 
