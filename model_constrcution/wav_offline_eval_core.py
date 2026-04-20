@@ -115,6 +115,16 @@ def wav_write(data, path, filename, fs):
     wav.write(full_path, fs, (data * 32767).astype(np.int16))
 
 
+def wav_read_float(wav_path):
+    fs, audio_data = wav.read(wav_path)
+    if audio_data.dtype != np.float32:
+        if np.issubdtype(audio_data.dtype, np.integer):
+            audio_data = audio_data.astype(np.float32) / np.iinfo(audio_data.dtype).max
+        else:
+            audio_data = audio_data.astype(np.float32)
+    return fs, audio_data
+
+
 def parse_csv_metadata(csv_path, categories):
     sample_category_counts = []
 
@@ -206,10 +216,20 @@ def load_offline_model(ckpt_path, device):
     return model
 
 
+def resolve_device(device_name):
+    if device_name == "cpu":
+        return torch.device("cpu")
+    if device_name == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA requested but is not available")
+        return torch.device("cuda")
+    if device_name == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    raise ValueError(f"Unsupported device: {device_name}")
+
+
 def process_offline(model, mixture_path, existing_classes, categories, device, win_len=512, win_inc=256, fft_len=512, debug=False):
-    fs_read, audio_data = wav.read(mixture_path)
-    if audio_data.dtype != np.float32:
-        audio_data = audio_data.astype(np.float32) / np.iinfo(audio_data.dtype).max
+    fs_read, audio_data = wav_read_float(mixture_path)
 
     if len(audio_data.shape) > 1:
         audio_data = np.mean(audio_data, axis=1)

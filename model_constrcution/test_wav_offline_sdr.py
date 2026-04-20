@@ -3,7 +3,6 @@ import argparse
 import os
 
 import numpy as np
-import torch
 from tqdm import tqdm
 
 from wav_offline_eval_core import (
@@ -12,10 +11,36 @@ from wav_offline_eval_core import (
     load_offline_model,
     print_category_stats,
     process_offline,
+    resolve_device,
     sdr_cost,
     sisdr_cost,
+    wav_read_float,
     wav_write,
 )
+
+
+def build_output_sample_name(sample_name, existing_classes, rename_output):
+    if rename_output and existing_classes:
+        classes_suffix = '-'.join(existing_classes)
+        return f"{sample_name}_{classes_suffix}"
+    return sample_name
+
+
+def load_existing_estimates(output_sample_dir, existing_classes, est_filename_map):
+    estimates = {}
+    missing_categories = []
+
+    for category in existing_classes:
+        estimate_path = os.path.join(output_sample_dir, est_filename_map[category])
+        if not os.path.exists(estimate_path):
+            missing_categories.append(category)
+            continue
+        _, estimate = wav_read_float(estimate_path)
+        if len(estimate.shape) > 1:
+            estimate = np.mean(estimate, axis=1)
+        estimates[category] = estimate
+
+    return estimates, missing_categories
 
 
 def main():
@@ -23,7 +48,20 @@ def main():
     parser.add_argument('--wav_dir', type=str, required=True, help='Directory with test wav samples')
     parser.add_argument('--ckpt_path', type=str, required=True, help='Path to model checkpoint .ckpt')
     parser.add_argument('--output_dir', type=str, default='./wav_offline_results', help='Folder to save results')
-    parser.add_argument('--use_cuda', action='store_true', default=True)
+    parser.add_argument(
+        '--mode',
+        type=str,
+        default='auto',
+        choices=['auto', 'infer_and_eval', 'eval_only'],
+        help='auto: reuse existing outputs when complete; eval_only: never infer; infer_and_eval: always infer',
+    )
+    parser.add_argument(
+        '--device',
+        type=str,
+        default='auto',
+        choices=['auto', 'cuda', 'cpu'],
+        help='Device for model inference',
+    )
     parser.add_argument('--num_samples', type=int, default=None, help='Number of samples to test')
     parser.add_argument('--rename_output', action='store_true', default=True, help='Rename output dir with classes suffix')
 
@@ -43,12 +81,9 @@ def main():
         'others': 'others_es.wav',
     }
 
-    device = torch.device("cuda" if args.use_cuda and torch.cuda.is_available() else "cpu")
+    device = resolve_device(args.device)
     print(f"Using device: {device}")
-
-    print("Loading model...")
-    model = load_offline_model(args.ckpt_path, device)
-    print("Model loaded!")
+    print(f"Mode: {args.mode}")
 
     sample_dirs = collect_sample_dirs(args.wav_dir, args.num_samples)
     print(f"Found {len(sample_dirs)} samples")
@@ -58,37 +93,56 @@ def main():
     win_len = 512
     win_inc = 256
     fft_len = 512
+    model = None
 
     for sample_dir in tqdm(sample_dirs, desc="Processing samples"):
         sample_name = os.path.basename(sample_dir)
         mixture_path = os.path.join(sample_dir, 'mixture.wav')
 
         existing_classes, gt_paths = get_existing_classes(sample_dir, categories, gt_filename_map)
-
-        if args.rename_output and existing_classes:
-            classes_suffix = '-'.join(existing_classes)
-            output_sample_name = f"{sample_name}_{classes_suffix}"
-        else:
-            output_sample_name = sample_name
-
+        output_sample_name = build_output_sample_name(sample_name, existing_classes, args.rename_output)
         output_sample_dir = os.path.join(args.output_dir, output_sample_name)
         os.makedirs(output_sample_dir, exist_ok=True)
 
-        results, fs = process_offline(
-            model,
-            mixture_path,
-            existing_classes,
-            categories,
-            device,
-            win_len,
-            win_inc,
-            fft_len,
-            debug=True,
-        )
+        estimates, missing_categories = load_existing_estimates(output_sample_dir, existing_classes, est_filename_map)
+        should_infer = args.mode == 'infer_and_eval' or (args.mode == 'auto' and bool(missing_categories))
+
+        if args.mode == 'eval_only' and missing_categories:
+            missing_labels = ', '.join(missing_categories)
+            raise FileNotFoundError(
+                f"Missing estimated wavs for {sample_name} in eval_only mode: {missing_labels}"
+            )
+
+        fs = gt_paths[existing_classes[0]][0] if existing_classes else 16000
+
+        if should_infer:
+            if model is None:
+                print("Loading model...")
+                model = load_offline_model(args.ckpt_path, device)
+                print("Model loaded!")
+
+            results, fs = process_offline(
+                model,
+                mixture_path,
+                existing_classes,
+                categories,
+                device,
+                win_len,
+                win_inc,
+                fft_len,
+                debug=False,
+            )
+
+            for category in existing_classes:
+                if category in results:
+                    estimates[category] = results[category]
+                    wav_write(results[category], output_sample_dir, est_filename_map[category], fs)
+
+            wav_write(results['mixture'], output_sample_dir, 'mixture.wav', fs)
 
         for category in categories:
-            if category in existing_classes and category in results:
-                estimate = results[category]
+            if category in existing_classes and category in estimates:
+                estimate = estimates[category]
                 _, target = gt_paths[category]
                 min_len = min(len(estimate), len(target))
                 category_sdr = sdr_cost(estimate[:min_len], target[:min_len])
@@ -96,8 +150,6 @@ def main():
                 all_metrics[category]['sdr'].append(category_sdr)
                 all_metrics[category]['sisdr'].append(category_sisdr)
                 wav_write(estimate, output_sample_dir, est_filename_map[category], fs)
-
-        wav_write(results['mixture'], output_sample_dir, 'mixture.wav', fs)
 
     print("\n" + "=" * 60)
     print("SDR Statistics (Offline):")
