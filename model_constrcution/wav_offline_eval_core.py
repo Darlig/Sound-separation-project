@@ -191,16 +191,20 @@ def get_existing_classes(sample_dir, categories, gt_filename_map):
     return existing_classes, gt_paths
 
 
-def print_category_stats(label, sdr_values, sisdr_values):
+def print_category_stats(label, sdr_values, sisdr_values, sdri_values=None):
     if sdr_values:
         print(f"{label} SDR:    {np.mean(sdr_values):.2f} +/- {np.std(sdr_values):.2f}")
         print(f"{label} SI-SDR: {np.mean(sisdr_values):.2f} +/- {np.std(sisdr_values):.2f}")
+        if sdri_values:
+            print(f"{label} SDRi:   {np.mean(sdri_values):.2f} +/- {np.std(sdri_values):.2f}")
 
 
-def print_bucket_stats(title, sdr_values, sisdr_values):
+def print_bucket_stats(title, sdr_values, sisdr_values, sdri_values=None):
     if sdr_values:
         print(f"{title} SDR:     {np.mean(sdr_values):.2f} +/- {np.std(sdr_values):.2f}")
         print(f"{title} SI-SDR:  {np.mean(sisdr_values):.2f} +/- {np.std(sisdr_values):.2f}")
+        if sdri_values:
+            print(f"{title} SDRi:    {np.mean(sdri_values):.2f} +/- {np.std(sdri_values):.2f}")
 
 
 def load_offline_model(ckpt_path, device):

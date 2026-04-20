@@ -46,6 +46,13 @@ def load_existing_estimates(output_sample_dir, existing_classes, est_filename_ma
     return estimates, missing_categories
 
 
+def load_mixture_audio(mixture_path):
+    _, mixture = wav_read_float(mixture_path)
+    if len(mixture.shape) > 1:
+        mixture = np.mean(mixture, axis=1)
+    return mixture
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--wav_dir', type=str, required=True, help='Directory with test wav samples')
@@ -101,13 +108,13 @@ def main():
     if args.csv_path is not None:
         sample_category_counts = parse_csv_metadata(args.csv_path, categories)
 
-    all_metrics = {category: {'sdr': [], 'sisdr': []} for category in categories}
+    all_metrics = {category: {'sdr': [], 'sisdr': [], 'sdri': []} for category in categories}
     bucket_metrics = None
     if sample_category_counts is not None:
         bucket_metrics = {}
         for category in categories:
-            bucket_metrics[f'{category}_single'] = {'sdr': [], 'sisdr': []}
-            bucket_metrics[f'{category}_multi'] = {'sdr': [], 'sisdr': []}
+            bucket_metrics[f'{category}_single'] = {'sdr': [], 'sisdr': [], 'sdri': []}
+            bucket_metrics[f'{category}_multi'] = {'sdr': [], 'sisdr': [], 'sdri': []}
 
     win_len = 512
     win_inc = 256
@@ -117,6 +124,7 @@ def main():
     for sample_dir in tqdm(sample_dirs, desc="Processing samples"):
         sample_name = os.path.basename(sample_dir)
         mixture_path = os.path.join(sample_dir, 'mixture.wav')
+        mixture = load_mixture_audio(mixture_path)
 
         existing_classes, gt_paths = get_existing_classes(sample_dir, categories, gt_filename_map)
         output_sample_name = build_output_sample_name(sample_name, existing_classes, args.rename_output)
@@ -175,21 +183,30 @@ def main():
                 min_len = min(len(estimate), len(target))
                 category_sdr = sdr_cost(estimate[:min_len], target[:min_len])
                 category_sisdr = sisdr_cost(estimate[:min_len], target[:min_len])
+                mixture_sdr = sdr_cost(mixture[:min_len], target[:min_len])
+                category_sdri = category_sdr - mixture_sdr
                 all_metrics[category]['sdr'].append(category_sdr)
                 all_metrics[category]['sisdr'].append(category_sisdr)
+                all_metrics[category]['sdri'].append(category_sdri)
                 wav_write(estimate, output_sample_dir, est_filename_map[category], fs)
 
                 if category_counts is not None and category_counts[category] >= 1:
                     bucket_name = f"{category}_single" if category_counts[category] == 1 else f"{category}_multi"
                     bucket_metrics[bucket_name]['sdr'].append(category_sdr)
                     bucket_metrics[bucket_name]['sisdr'].append(category_sisdr)
+                    bucket_metrics[bucket_name]['sdri'].append(category_sdri)
 
     print("\n" + "=" * 60)
     print("SDR Statistics (Offline, Speech/Concert/Bird):")
     print("=" * 60)
 
     for category in categories:
-        print_category_stats(category.capitalize(), all_metrics[category]['sdr'], all_metrics[category]['sisdr'])
+        print_category_stats(
+            category.capitalize(),
+            all_metrics[category]['sdr'],
+            all_metrics[category]['sisdr'],
+            all_metrics[category]['sdri'],
+        )
 
     if bucket_metrics is not None:
         print("\nCategory Count Breakdown:")
@@ -198,22 +215,27 @@ def main():
                 f"{category.capitalize()} Single-Source",
                 bucket_metrics[f'{category}_single']['sdr'],
                 bucket_metrics[f'{category}_single']['sisdr'],
+                bucket_metrics[f'{category}_single']['sdri'],
             )
             print_bucket_stats(
                 f"{category.capitalize()} Multi-Source",
                 bucket_metrics[f'{category}_multi']['sdr'],
                 bucket_metrics[f'{category}_multi']['sisdr'],
+                bucket_metrics[f'{category}_multi']['sdri'],
             )
 
     all_sdr = []
     all_sisdr = []
+    all_sdri = []
     for category in categories:
         all_sdr.extend(all_metrics[category]['sdr'])
         all_sisdr.extend(all_metrics[category]['sisdr'])
+        all_sdri.extend(all_metrics[category]['sdri'])
 
     if all_sdr:
         print(f"\nTotal Average SDR:    {np.mean(all_sdr):.2f} +/- {np.std(all_sdr):.2f}")
         print(f"Total Average SI-SDR: {np.mean(all_sisdr):.2f} +/- {np.std(all_sisdr):.2f}")
+        print(f"Total Average SDRi:   {np.mean(all_sdri):.2f} +/- {np.std(all_sdri):.2f}")
 
     print("=" * 60)
 
