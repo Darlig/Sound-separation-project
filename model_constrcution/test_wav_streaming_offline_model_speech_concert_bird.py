@@ -54,10 +54,61 @@ def get_sample_index(sample_name):
     return int(match.group(1))
 
 
-def print_bucket_stats(title, sdr_values, sisdr_values):
+def print_bucket_stats(title, sdr_values, sisdr_values, sdri_values=None):
     if sdr_values:
         print(f"{title} SDR:     {np.mean(sdr_values):.2f} +/- {np.std(sdr_values):.2f}")
         print(f"{title} SI-SDR:  {np.mean(sisdr_values):.2f} +/- {np.std(sisdr_values):.2f}")
+        if sdri_values is not None:
+            print(f"{title} SDRi:    {np.mean(sdri_values):.2f} +/- {np.std(sdri_values):.2f}")
+
+
+def wav_read_float(path):
+    fs, audio = wav.read(path)
+    if audio.dtype != np.float32:
+        if np.issubdtype(audio.dtype, np.integer):
+            audio = audio.astype(np.float32) / np.iinfo(audio.dtype).max
+        else:
+            audio = audio.astype(np.float32)
+    if len(audio.shape) > 1:
+        audio = np.mean(audio, axis=1)
+    return fs, audio
+
+
+def load_existing_estimates(output_sample_dir, valid_categories, est_filename_map):
+    estimates = {}
+    missing_categories = []
+
+    for category in valid_categories:
+        estimate_path = os.path.join(output_sample_dir, est_filename_map[category])
+        if not os.path.exists(estimate_path):
+            missing_categories.append(category)
+            continue
+        _, estimates[category] = wav_read_float(estimate_path)
+
+    return estimates, missing_categories
+
+
+def load_separator(ckpt_path, device, chunk_size):
+    print("Loading model...")
+    model = ComplexMTASSLightning.load_from_checkpoint(
+        ckpt_path,
+        map_location=device,
+        model_class=Complex_MTASS,
+        loss_class=Complex_MTASS_model,
+    )
+    model.to(device)
+    model.eval()
+    model.freeze()
+    print("Model loaded!")
+
+    return RealTimeAudioSeparator(
+        model,
+        win_len=512,
+        win_inc=256,
+        fft_len=512,
+        chunk_size=chunk_size,
+        device=device
+    )
 
 
 def sdr_cost(estimated, target, eps=1e-8):
@@ -326,6 +377,13 @@ def main():
     parser.add_argument('--ckpt_path', type=str, required=True, help='Path to Complex_MTASS checkpoint .ckpt')
     parser.add_argument('--output_dir', type=str, default='./wav_streaming_offline_model_results_speech_concert_bird', help='Folder to save results')
     parser.add_argument('--csv_path', type=str, default=None, help='CSV metadata path generated for the wav samples')
+    parser.add_argument(
+        '--mode',
+        type=str,
+        default='auto',
+        choices=['auto', 'infer_and_eval', 'eval_only'],
+        help='auto: reuse existing outputs when complete; eval_only: never infer; infer_and_eval: always infer',
+    )
     parser.add_argument('--use_cuda', action='store_true', default=True)
     parser.add_argument('--chunk_size', type=int, default=32, help='Chunk size (frames)')
     parser.add_argument('--num_samples', type=int, default=None, help='Number of samples to test')
@@ -334,27 +392,20 @@ def main():
 
     device = torch.device("cuda" if args.use_cuda and torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
+    print(f"Mode: {args.mode}")
 
-    print("Loading model...")
-    model = ComplexMTASSLightning.load_from_checkpoint(
-        args.ckpt_path,
-        map_location=device,
-        model_class=Complex_MTASS,
-        loss_class=Complex_MTASS_model,
-    )
-    model.to(device)
-    model.eval()
-    model.freeze()
-    print("Model loaded!")
-
-    separator = RealTimeAudioSeparator(
-        model,
-        win_len=512,
-        win_inc=256,
-        fft_len=512,
-        chunk_size=args.chunk_size,
-        device=device
-    )
+    categories = ['speech', 'concert', 'bird']
+    gt_filename_map = {
+        'speech': 'speech_gt.wav',
+        'concert': 'concert_gt.wav',
+        'bird': 'bird_gt.wav',
+    }
+    est_filename_map = {
+        'speech': 'speech_es.wav',
+        'concert': 'concert_es.wav',
+        'bird': 'bird_es.wav',
+    }
+    separator = None
 
     sample_dirs = []
     for item in sorted(os.listdir(args.wav_dir)):
@@ -381,13 +432,16 @@ def main():
     all_speech_sisdr = []
     all_concert_sisdr = []
     all_bird_sisdr = []
+    all_speech_sdri = []
+    all_concert_sdri = []
+    all_bird_sdri = []
     bucket_metrics = {
-        'speech_single': {'sdr': [], 'sisdr': []},
-        'speech_multi': {'sdr': [], 'sisdr': []},
-        'concert_single': {'sdr': [], 'sisdr': []},
-        'concert_multi': {'sdr': [], 'sisdr': []},
-        'bird_single': {'sdr': [], 'sisdr': []},
-        'bird_multi': {'sdr': [], 'sisdr': []},
+        'speech_single': {'sdr': [], 'sisdr': [], 'sdri': []},
+        'speech_multi': {'sdr': [], 'sisdr': [], 'sdri': []},
+        'concert_single': {'sdr': [], 'sisdr': [], 'sdri': []},
+        'concert_multi': {'sdr': [], 'sisdr': [], 'sdri': []},
+        'bird_single': {'sdr': [], 'sisdr': [], 'sdri': []},
+        'bird_multi': {'sdr': [], 'sisdr': [], 'sdri': []},
     }
 
     for sample_idx, sample_dir in enumerate(tqdm(sample_dirs, desc="Processing samples")):
@@ -402,86 +456,123 @@ def main():
                 )
             category_counts = sample_category_counts[csv_sample_idx]
 
-        mixture_path = os.path.join(sample_dir, 'mixture.wav')
-        speech_gt_path = os.path.join(sample_dir, 'speech_gt.wav')
-        concert_gt_path = os.path.join(sample_dir, 'concert_gt.wav')
-        bird_gt_path = os.path.join(sample_dir, 'bird_gt.wav')
-
-        fs, speech_gt = wav.read(speech_gt_path)
-        fs, concert_gt = wav.read(concert_gt_path)
-        fs, bird_gt = wav.read(bird_gt_path)
-
-        if speech_gt.dtype != np.float32:
-            speech_gt = speech_gt.astype(np.float32) / 32767.0
-            concert_gt = concert_gt.astype(np.float32) / 32767.0
-            bird_gt = bird_gt.astype(np.float32) / 32767.0
-
         eps = 1e-8
-        valid_speech = np.sum(speech_gt ** 2) > eps
-        valid_concert = np.sum(concert_gt ** 2) > eps
-        valid_bird = np.sum(bird_gt ** 2) > eps
+        mixture_path = os.path.join(sample_dir, 'mixture.wav')
+        _, mixture = wav_read_float(mixture_path)
+        gt_audio = {}
+        fs = 16000
+        valid_categories = []
+        for category in categories:
+            gt_path = os.path.join(sample_dir, gt_filename_map[category])
+            fs, target = wav_read_float(gt_path)
+            gt_audio[category] = target
+            if np.sum(target ** 2) > eps:
+                valid_categories.append(category)
 
-        speech_es, concert_es, bird_es = separator.process_file(mixture_path, output_sample_dir, fs)
+        estimates, missing_categories = load_existing_estimates(
+            output_sample_dir,
+            valid_categories,
+            est_filename_map,
+        )
+        should_infer = args.mode == 'infer_and_eval' or (args.mode == 'auto' and bool(missing_categories))
 
-        if valid_speech and speech_es is not None:
+        if args.mode == 'eval_only' and missing_categories:
+            missing_labels = ', '.join(missing_categories)
+            raise FileNotFoundError(
+                f"Missing estimated wavs for {sample_name} in eval_only mode: {missing_labels}"
+            )
+
+        if should_infer:
+            if separator is None:
+                separator = load_separator(args.ckpt_path, device, args.chunk_size)
+
+            mixture_path = os.path.join(sample_dir, 'mixture.wav')
+            speech_es, concert_es, bird_es = separator.process_file(mixture_path, output_sample_dir, fs)
+            estimates.update({
+                'speech': speech_es,
+                'concert': concert_es,
+                'bird': bird_es,
+            })
+
+        if 'speech' in valid_categories and estimates.get('speech') is not None:
+            speech_es = estimates['speech']
+            speech_gt = gt_audio['speech']
             min_len = min(len(speech_es), len(speech_gt))
             speech_sdr = sdr_cost(speech_es[:min_len], speech_gt[:min_len])
             speech_sisdr = sisdr_cost(speech_es[:min_len], speech_gt[:min_len])
+            speech_mixture_sdr = sdr_cost(mixture[:min_len], speech_gt[:min_len])
+            speech_sdri = speech_sdr - speech_mixture_sdr
             all_speech_sdr.append(speech_sdr)
             all_speech_sisdr.append(speech_sisdr)
+            all_speech_sdri.append(speech_sdri)
             if category_counts is not None:
                 bucket_name = 'speech_single' if category_counts['speech'] == 1 else 'speech_multi'
                 if category_counts['speech'] >= 1:
                     bucket_metrics[bucket_name]['sdr'].append(speech_sdr)
                     bucket_metrics[bucket_name]['sisdr'].append(speech_sisdr)
+                    bucket_metrics[bucket_name]['sdri'].append(speech_sdri)
 
-        if valid_concert and concert_es is not None:
+        if 'concert' in valid_categories and estimates.get('concert') is not None:
+            concert_es = estimates['concert']
+            concert_gt = gt_audio['concert']
             min_len = min(len(concert_es), len(concert_gt))
             concert_sdr = sdr_cost(concert_es[:min_len], concert_gt[:min_len])
             concert_sisdr = sisdr_cost(concert_es[:min_len], concert_gt[:min_len])
+            concert_mixture_sdr = sdr_cost(mixture[:min_len], concert_gt[:min_len])
+            concert_sdri = concert_sdr - concert_mixture_sdr
             all_concert_sdr.append(concert_sdr)
             all_concert_sisdr.append(concert_sisdr)
+            all_concert_sdri.append(concert_sdri)
             if category_counts is not None:
                 bucket_name = 'concert_single' if category_counts['concert'] == 1 else 'concert_multi'
                 if category_counts['concert'] >= 1:
                     bucket_metrics[bucket_name]['sdr'].append(concert_sdr)
                     bucket_metrics[bucket_name]['sisdr'].append(concert_sisdr)
+                    bucket_metrics[bucket_name]['sdri'].append(concert_sdri)
 
-        if valid_bird and bird_es is not None:
+        if 'bird' in valid_categories and estimates.get('bird') is not None:
+            bird_es = estimates['bird']
+            bird_gt = gt_audio['bird']
             min_len = min(len(bird_es), len(bird_gt))
             bird_sdr = sdr_cost(bird_es[:min_len], bird_gt[:min_len])
             bird_sisdr = sisdr_cost(bird_es[:min_len], bird_gt[:min_len])
+            bird_mixture_sdr = sdr_cost(mixture[:min_len], bird_gt[:min_len])
+            bird_sdri = bird_sdr - bird_mixture_sdr
             all_bird_sdr.append(bird_sdr)
             all_bird_sisdr.append(bird_sisdr)
+            all_bird_sdri.append(bird_sdri)
             if category_counts is not None:
                 bucket_name = 'bird_single' if category_counts['bird'] == 1 else 'bird_multi'
                 if category_counts['bird'] >= 1:
                     bucket_metrics[bucket_name]['sdr'].append(bird_sdr)
                     bucket_metrics[bucket_name]['sisdr'].append(bird_sisdr)
+                    bucket_metrics[bucket_name]['sdri'].append(bird_sdri)
 
     print("\n" + "=" * 60)
     print("SDR Statistics (Streaming with Complex_MTASS Offline Model):")
     print("=" * 60)
 
-    print_bucket_stats("Speech", all_speech_sdr, all_speech_sisdr)
-    print_bucket_stats("Concert", all_concert_sdr, all_concert_sisdr)
-    print_bucket_stats("Bird", all_bird_sdr, all_bird_sisdr)
+    print_bucket_stats("Speech", all_speech_sdr, all_speech_sisdr, all_speech_sdri)
+    print_bucket_stats("Concert", all_concert_sdr, all_concert_sisdr, all_concert_sdri)
+    print_bucket_stats("Bird", all_bird_sdr, all_bird_sisdr, all_bird_sdri)
 
     if sample_category_counts is not None:
         print("\nCategory Count Breakdown:")
-        print_bucket_stats("Speech Single-Source", bucket_metrics['speech_single']['sdr'], bucket_metrics['speech_single']['sisdr'])
-        print_bucket_stats("Speech Multi-Source", bucket_metrics['speech_multi']['sdr'], bucket_metrics['speech_multi']['sisdr'])
-        print_bucket_stats("Concert Single-Source", bucket_metrics['concert_single']['sdr'], bucket_metrics['concert_single']['sisdr'])
-        print_bucket_stats("Concert Multi-Source", bucket_metrics['concert_multi']['sdr'], bucket_metrics['concert_multi']['sisdr'])
-        print_bucket_stats("Bird Single-Source", bucket_metrics['bird_single']['sdr'], bucket_metrics['bird_single']['sisdr'])
-        print_bucket_stats("Bird Multi-Source", bucket_metrics['bird_multi']['sdr'], bucket_metrics['bird_multi']['sisdr'])
+        print_bucket_stats("Speech Single-Source", bucket_metrics['speech_single']['sdr'], bucket_metrics['speech_single']['sisdr'], bucket_metrics['speech_single']['sdri'])
+        print_bucket_stats("Speech Multi-Source", bucket_metrics['speech_multi']['sdr'], bucket_metrics['speech_multi']['sisdr'], bucket_metrics['speech_multi']['sdri'])
+        print_bucket_stats("Concert Single-Source", bucket_metrics['concert_single']['sdr'], bucket_metrics['concert_single']['sisdr'], bucket_metrics['concert_single']['sdri'])
+        print_bucket_stats("Concert Multi-Source", bucket_metrics['concert_multi']['sdr'], bucket_metrics['concert_multi']['sisdr'], bucket_metrics['concert_multi']['sdri'])
+        print_bucket_stats("Bird Single-Source", bucket_metrics['bird_single']['sdr'], bucket_metrics['bird_single']['sisdr'], bucket_metrics['bird_single']['sdri'])
+        print_bucket_stats("Bird Multi-Source", bucket_metrics['bird_multi']['sdr'], bucket_metrics['bird_multi']['sisdr'], bucket_metrics['bird_multi']['sdri'])
 
     all_sdr = all_speech_sdr + all_concert_sdr + all_bird_sdr
     all_sisdr = all_speech_sisdr + all_concert_sisdr + all_bird_sisdr
+    all_sdri = all_speech_sdri + all_concert_sdri + all_bird_sdri
 
     if all_sdr:
         print(f"\nTotal Average SDR:    {np.mean(all_sdr):.2f} +/- {np.std(all_sdr):.2f}")
         print(f"Total Average SI-SDR: {np.mean(all_sisdr):.2f} +/- {np.std(all_sisdr):.2f}")
+        print(f"Total Average SDRi:   {np.mean(all_sdri):.2f} +/- {np.std(all_sdri):.2f}")
 
     print("=" * 60)
 
