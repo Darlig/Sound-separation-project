@@ -9,6 +9,7 @@ DATA_ROOT = Path("dataset/3class_speech_concert_bird")
 SPEECH_WAV_ROOT = Path("/work107/luoxiaoxue/data/VGGSound/audios_16k")
 BIRD_SOURCE_WEIGHTS = {"xc": 0.85, "vgg": 0.15}
 BIRD_SPLIT_SIZES = {"valid": 300, "test": 150}
+SOURCE_CATEGORIES = ("speech", "concert", "bird")
 
 
 def load_split_csv(csv_path):
@@ -102,8 +103,11 @@ def load_category_pools(split):
 
 
 def sample_one_source(category_pools, bird_source_pools):
-    category = random.choice(["speech", "concert", "bird"])
+    category = random.choice(SOURCE_CATEGORIES)
+    return sample_one_source_from_category(category, category_pools, bird_source_pools)
 
+
+def sample_one_source_from_category(category, category_pools, bird_source_pools):
     if category == "bird":
         bird_source = random.choices(
             population=["xc", "vgg"],
@@ -120,19 +124,33 @@ def sample_one_source(category_pools, bird_source_pools):
     }
 
 
-def generate_mixed_csv(output_csv, num_samples, num_sources, split):
+def sample_one_source_per_category(category_pools, bird_source_pools):
+    selected_samples = [
+        sample_one_source_from_category(category, category_pools, bird_source_pools)
+        for category in SOURCE_CATEGORIES
+    ]
+    random.shuffle(selected_samples)
+    return selected_samples
+
+
+def generate_mixed_csv(output_csv, num_samples, num_sources, split, one_source_per_category=False):
     category_pools, bird_source_pools = load_category_pools(split)
     output_data = []
 
     for _ in range(num_samples):
-        while True:
-            selected_samples = [
-                sample_one_source(category_pools, bird_source_pools)
-                for _ in range(num_sources)
-            ]
-            current_categories = [sample["category"] for sample in selected_samples]
-            if len(set(current_categories)) > 1:
-                break
+        if one_source_per_category:
+            selected_samples = sample_one_source_per_category(
+                category_pools, bird_source_pools
+            )
+        else:
+            while True:
+                selected_samples = [
+                    sample_one_source(category_pools, bird_source_pools)
+                    for _ in range(num_sources)
+                ]
+                current_categories = [sample["category"] for sample in selected_samples]
+                if len(set(current_categories)) > 1:
+                    break
 
         row_data = []
         for sample in selected_samples:
@@ -149,27 +167,83 @@ def generate_mixed_csv(output_csv, num_samples, num_sources, split):
     output_df.to_csv(output_csv, index=False)
     print(f"已生成 {num_samples} 条混合音频数据到 {output_csv}")
     print(f"数据形状: {output_df.shape}")
+    if one_source_per_category:
+        print("生成模式: speech/concert/bird 每类各一个源")
+
+
+def export_bird_split_csvs(output_dir, random_seed=42):
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    bird_splits = build_bird_splits(random_seed=random_seed)
+    for split in ("train", "valid", "test"):
+        output_csv = output_dir / f"bird_{split}.csv"
+        bird_splits[split].to_csv(output_csv, index=False)
+        print(f"已导出 bird {split} CSV 到 {output_csv}")
+        print(f"数据形状: {bird_splits[split].shape}")
 
 
 def main():
     parser = argparse.ArgumentParser(description="生成三类混合音频数据的CSV文件")
-    parser.add_argument("--output_csv", type=str, required=True, help="输出CSV文件路径")
+    parser.add_argument("--output_csv", type=str, help="输出CSV文件路径")
     parser.add_argument(
         "--type",
         type=str,
         choices=["train", "valid", "test"],
-        required=True,
         help="生成的数据集类型",
     )
     parser.add_argument(
         "--num_sources",
         type=int,
         choices=[2, 3, 4, 5],
-        required=True,
         help="混合声源数量: 2, 3, 4 或 5",
+    )
+    parser.add_argument(
+        "--export_bird_splits",
+        action="store_true",
+        help="导出 bird_train.csv、bird_valid.csv、bird_test.csv 后退出",
+    )
+    parser.add_argument(
+        "--bird_output_dir",
+        type=str,
+        default=None,
+        help="bird split CSV 输出目录；默认输出到 dataset/3class_speech_concert_bird",
+    )
+    parser.add_argument(
+        "--random_seed",
+        type=int,
+        default=42,
+        help="bird split 随机种子",
+    )
+    parser.add_argument(
+        "--one_source_per_category",
+        action="store_true",
+        help="仅用于 3mix：每条样本固定包含 speech、concert、bird 各一个源",
     )
 
     args = parser.parse_args()
+
+    if args.export_bird_splits:
+        output_dir = args.bird_output_dir or DATA_ROOT
+        export_bird_split_csvs(output_dir, random_seed=args.random_seed)
+        return
+
+    missing_args = [
+        arg_name
+        for arg_name, value in (
+            ("--output_csv", args.output_csv),
+            ("--type", args.type),
+            ("--num_sources", args.num_sources),
+        )
+        if value is None
+    ]
+    if missing_args:
+        parser.error(
+            "生成混合 CSV 时需要参数: " + ", ".join(missing_args)
+        )
+
+    if args.one_source_per_category and args.num_sources != 3:
+        parser.error("--one_source_per_category 只能与 --num_sources 3 一起使用")
 
     if args.type == "train":
         num_samples = 20000
@@ -184,6 +258,7 @@ def main():
         num_samples=num_samples,
         num_sources=args.num_sources,
         split=args.type,
+        one_source_per_category=args.one_source_per_category,
     )
 
 
