@@ -3,13 +3,14 @@ import argparse
 import torch
 import h5py
 import pytorch_lightning as pl
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
 
 from DNN_models.Complex_MTASS_model import ComplexMTASSLightning
 from DNN_models.Complex_MTASS import *
 from DNN_models.Complex_MTASS_Solver import *
+from online_mix_dataset import OnlineMixDataset
 
 class HDF5Dataset(Dataset):
     def __init__(self, h5_path):
@@ -43,8 +44,7 @@ def main(args):
     magnitude_l1_loss_weight = args.magnitude_l1_loss_weight
 
     # Load dataset
-    data_train = HDF5Dataset(args.train_h5)
-    data_val = HDF5Dataset(args.val_h5)
+    data_train, data_val = build_datasets(args)
     train_loader = DataLoader(data_train,
                               batch_size=args.batch_size,
                               shuffle=True,
@@ -84,7 +84,7 @@ def main(args):
         devices=args.gpus if args.use_cuda else "auto",
         accelerator="gpu" if args.use_cuda else "cpu",
         benchmark=True,
-        strategy="ddp",
+        strategy="ddp" if args.use_cuda else "auto",
         max_epochs=args.epochs,
         logger=logger,
         callbacks=[checkpoint_callback],
@@ -100,11 +100,74 @@ def main(args):
     
     trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader, ckpt_path=ckpt_path)
 
+
+def build_datasets(args):
+    if args.data_mode == 'h5':
+        return HDF5Dataset(args.train_h5), HDF5Dataset(args.val_h5)
+
+    missing_args = [
+        arg_name
+        for arg_name, value in (
+            ('--train_source_csv', args.train_source_csv),
+            ('--val_source_csv', args.val_source_csv),
+        )
+        if value is None
+    ]
+    if missing_args:
+        raise ValueError(
+            "--data_mode online_csv requires " + ", ".join(missing_args)
+        )
+
+    common_kwargs = dict(
+        audio_root=args.audio_root,
+        num_sources_choices=args.online_num_sources,
+        snr_min=args.snr_min,
+        snr_max=args.snr_max,
+        target_duration=args.target_duration,
+        seed=args.online_seed,
+    )
+    data_train = OnlineMixDataset(
+        source_csv=args.train_source_csv,
+        samples_per_epoch=args.train_samples_per_epoch,
+        deterministic=False,
+        **common_kwargs,
+    )
+    data_val = OnlineMixDataset(
+        source_csv=args.val_source_csv,
+        samples_per_epoch=args.val_samples_per_epoch,
+        deterministic=True,
+        **common_kwargs,
+    )
+    return data_train, data_val
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('exp_dir', type=str, default='./model_parameters')
+    parser.add_argument('--data_mode', type=str, default='h5', choices=['h5', 'online_csv'],
+                        help="Dataset mode: h5 uses pre-extracted features, online_csv mixes raw audio online")
     parser.add_argument('--train_h5', type=str, default='/ssd2.m2/sound/VGGSound/imagebind/train_ready.h5')
     parser.add_argument('--val_h5', type=str, default='/ssd2.m2/sound/VGGSound/imagebind/dev_ready.h5')
+    parser.add_argument('--train_source_csv', type=str, default=None,
+                        help="Single-category source CSV for online training")
+    parser.add_argument('--val_source_csv', type=str, default=None,
+                        help="Single-category source CSV for deterministic online validation")
+    parser.add_argument('--audio_root', type=str, default=None,
+                        help="Root directory for relative audio paths in online source CSVs")
+    parser.add_argument('--train_samples_per_epoch', type=int, default=20000,
+                        help="Number of online mixtures sampled for each training epoch")
+    parser.add_argument('--val_samples_per_epoch', type=int, default=5000,
+                        help="Number of deterministic online mixtures sampled for each validation epoch")
+    parser.add_argument('--online_num_sources', nargs='+', type=int, default=[2, 3],
+                        help="Possible number of unique-category sources per online mixture")
+    parser.add_argument('--snr_min', type=float, default=-3.0,
+                        help="Minimum SNR in dB for non-reference online sources")
+    parser.add_argument('--snr_max', type=float, default=3.0,
+                        help="Maximum SNR in dB for non-reference online sources")
+    parser.add_argument('--target_duration', type=float, default=10.0,
+                        help="Online audio duration in seconds")
+    parser.add_argument('--online_seed', type=int, default=42,
+                        help="Seed used for online validation sampling")
     parser.add_argument('--resume_ckpt', type=str, default=None, help="Path to .ckpt to continue training")
     parser.add_argument("--gpus", nargs="+", type=int, help="e.g. --gpus 0 1 2")
 
@@ -123,6 +186,9 @@ if __name__ == '__main__':
                         help="Whether to use cuda")
 
     args = parser.parse_args()
+
+    if args.gpus is not None:
+        args.use_cuda = True
 
     os.makedirs(args.exp_dir, exist_ok=True)
     
