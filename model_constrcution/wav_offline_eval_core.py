@@ -262,3 +262,87 @@ def process_offline(model, mixture_path, existing_classes, categories, device, w
     results['mixture'] = mixture_wav.squeeze().detach().cpu().numpy()
 
     return results, fs_read
+
+
+def run_model_in_chunks(model, inputs, chunk_frames, debug=False):
+    if chunk_frames <= 0:
+        raise ValueError(f"chunk_frames must be positive, got {chunk_frames}")
+
+    num_frames = inputs.shape[-1]
+    z1_chunks = []
+    z2_chunks = []
+    z3_chunks = []
+
+    with torch.no_grad():
+        for start in range(0, num_frames, chunk_frames):
+            end = min(start + chunk_frames, num_frames)
+            input_chunk = inputs[:, :, start:end]
+            if debug:
+                print(f"[DEBUG chunk] input frames {start}:{end}, shape={input_chunk.shape}")
+            z1_chunk, z2_chunk, z3_chunk = model(input_chunk)
+            expected_frames = end - start
+            for name, output_chunk in zip(("z1", "z2", "z3"), (z1_chunk, z2_chunk, z3_chunk)):
+                if output_chunk.shape[-1] != expected_frames:
+                    raise ValueError(
+                        f"Model output {name} has {output_chunk.shape[-1]} frames for "
+                        f"{expected_frames} input frames in chunk {start}:{end}"
+                    )
+            z1_chunks.append(z1_chunk)
+            z2_chunks.append(z2_chunk)
+            z3_chunks.append(z3_chunk)
+
+    return (
+        torch.cat(z1_chunks, dim=-1),
+        torch.cat(z2_chunks, dim=-1),
+        torch.cat(z3_chunks, dim=-1),
+    )
+
+
+def process_offline_chunked_model(
+    model,
+    mixture_path,
+    existing_classes,
+    categories,
+    device,
+    win_len=512,
+    win_inc=256,
+    fft_len=512,
+    chunk_frames=100,
+    debug=False,
+):
+    fs_read, audio_data = wav_read_float(mixture_path)
+
+    if len(audio_data.shape) > 1:
+        audio_data = np.mean(audio_data, axis=1)
+
+    audio_tensor = torch.from_numpy(audio_data).float().to(device)
+    audio_tensor = audio_tensor.unsqueeze(0)
+
+    if debug:
+        print(
+            f"[DEBUG process chunked] mixture_path={mixture_path}, "
+            f"audio_data.shape={audio_data.shape}, tensor.shape={audio_tensor.shape}"
+        )
+
+    x1 = stft(audio_tensor, win_len, win_inc, fft_len, device, debug=debug)
+
+    if debug:
+        num_frames = x1.shape[-1]
+        num_chunks = (num_frames + chunk_frames - 1) // chunk_frames
+        print(
+            f"[DEBUG process chunked] spec_shape={x1.shape}, "
+            f"chunk_frames={chunk_frames}, num_chunks={num_chunks}"
+        )
+
+    z1, z2, z3 = run_model_in_chunks(model, x1, chunk_frames, debug=debug)
+
+    results = {}
+    for category, output in zip(categories, [z1, z2, z3]):
+        if category in existing_classes:
+            est_wav = inverse_stft(output, win_len, win_inc, fft_len, device)
+            results[category] = est_wav.squeeze().detach().cpu().numpy()
+
+    mixture_wav = inverse_stft(x1, win_len, win_inc, fft_len, device)
+    results['mixture'] = mixture_wav.squeeze().detach().cpu().numpy()
+
+    return results, fs_read
