@@ -121,6 +121,7 @@ def build_datasets(args):
     common_kwargs = dict(
         audio_root=args.audio_root,
         num_sources_choices=args.online_num_sources,
+        num_sources_probs=args.online_num_sources_probs,
         snr_min=args.snr_min,
         snr_max=args.snr_max,
         target_duration=args.target_duration,
@@ -160,6 +161,8 @@ if __name__ == '__main__':
                         help="Number of deterministic online mixtures sampled for each validation epoch")
     parser.add_argument('--online_num_sources', nargs='+', type=int, default=[2, 3],
                         help="Possible number of unique-category sources per online mixture")
+    parser.add_argument('--online_num_sources_probs', nargs='+', type=float, default=None,
+                        help="Sampling weights for --online_num_sources; defaults to uniform")
     parser.add_argument('--snr_min', type=float, default=-3.0,
                         help="Minimum SNR in dB for non-reference online sources")
     parser.add_argument('--snr_max', type=float, default=3.0,

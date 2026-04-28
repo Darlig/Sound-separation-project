@@ -29,6 +29,7 @@ class OnlineMixDataset(Dataset):
         audio_root=None,
         samples_per_epoch=20000,
         num_sources_choices=(2, 3),
+        num_sources_probs=None,
         snr_min=-3.0,
         snr_max=3.0,
         target_sample_rate=TARGET_SAMPLE_RATE,
@@ -40,6 +41,9 @@ class OnlineMixDataset(Dataset):
         self.audio_root = Path(audio_root) if audio_root else None
         self.samples_per_epoch = int(samples_per_epoch)
         self.num_sources_choices = tuple(int(x) for x in num_sources_choices)
+        self.num_sources_probs = (
+            None if num_sources_probs is None else tuple(float(x) for x in num_sources_probs)
+        )
         self.snr_min = float(snr_min)
         self.snr_max = float(snr_max)
         self.target_sample_rate = int(target_sample_rate)
@@ -65,6 +69,19 @@ class OnlineMixDataset(Dataset):
                 f"--online_num_sources values must be between 1 and {len(CATEGORIES)}: "
                 f"{invalid_num_sources}"
             )
+        if self.num_sources_probs is not None:
+            if len(self.num_sources_probs) != len(self.num_sources_choices):
+                raise ValueError(
+                    "--online_num_sources_probs must have the same length as "
+                    "--online_num_sources"
+                )
+            negative_probs = [x for x in self.num_sources_probs if x < 0]
+            if negative_probs:
+                raise ValueError(
+                    f"--online_num_sources_probs values must be non-negative: {negative_probs}"
+                )
+            if sum(self.num_sources_probs) <= 0:
+                raise ValueError("--online_num_sources_probs must sum to a positive value")
         if self.snr_min > self.snr_max:
             raise ValueError("--snr_min must be <= --snr_max")
 
@@ -158,7 +175,14 @@ class OnlineMixDataset(Dataset):
         return random.Random(worker_seed + int(idx))
 
     def _sample_categories(self, rng):
-        num_sources = rng.choice(self.num_sources_choices)
+        if self.num_sources_probs is None:
+            num_sources = rng.choice(self.num_sources_choices)
+        else:
+            num_sources = rng.choices(
+                self.num_sources_choices,
+                weights=self.num_sources_probs,
+                k=1,
+            )[0]
         return rng.sample(list(CATEGORIES), k=num_sources)
 
     def _load_wav(self, path, rng):
