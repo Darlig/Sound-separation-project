@@ -102,7 +102,7 @@ def generate_wavs_from_csv(csv_path, output_dir, num_samples=None):
                 valid = False
                 break
 
-        if not valid or len(audios) < 2:
+        if not valid or len(audios) < 1:
             continue
 
         mixed_wav, scaled_sources = mix_audios(audios, snrs)

@@ -76,6 +76,9 @@ def load_category_pools(source_root, split):
 
 
 def sample_categories(num_sources, rng):
+    if num_sources == 1:
+        return [rng.choice(SOURCE_CATEGORIES)]
+
     while True:
         categories = [rng.choice(SOURCE_CATEGORIES) for _ in range(num_sources)]
         if len(set(categories)) > 1:
@@ -169,7 +172,9 @@ def generate_mixed_csv(output_csv, category_pools, num_samples, num_sources, spl
 
     print(f"已生成 {num_samples} 条混合音频数据到 {output_csv}")
     print(f"数据形状: ({len(output_rows)}, {len(output_columns)})")
-    if one_source_per_category:
+    if num_sources == 1:
+        print("生成模式: 1mix，speech/concert/bird 三类随机近似等比例抽取")
+    elif one_source_per_category:
         print("生成模式: speech/concert/bird 每类各一个源")
 
 
@@ -186,8 +191,8 @@ def main():
     parser.add_argument(
         "--num_sources",
         type=int,
-        choices=[2, 3, 4, 5],
-        help="混合声源数量: 2, 3, 4 或 5",
+        choices=[1, 2, 3, 4, 5],
+        help="混合声源数量: 1, 2, 3, 4 或 5",
     )
     parser.add_argument(
         "--num_samples",
