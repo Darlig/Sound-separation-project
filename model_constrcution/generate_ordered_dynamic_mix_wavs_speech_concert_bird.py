@@ -178,8 +178,8 @@ def build_specs(sampled_trials):
     )
     three_two_one_orders = split_half_orders(
         len(sampled_trials),
-        ("bird", "speech", "concert"),
-        ("bird", "concert", "speech"),
+        ("speech", "concert", "bird"),
+        ("concert", "speech", "bird"),
     )
 
     spec_inputs = [
