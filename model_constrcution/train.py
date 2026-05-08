@@ -126,6 +126,9 @@ def build_datasets(args):
         snr_max=args.snr_max,
         target_duration=args.target_duration,
         seed=args.online_seed,
+        rir_root=args.rir_root,
+        rir_prob=args.rir_prob,
+        rir_room_probs=args.rir_room_probs,
     )
     data_train = OnlineMixDataset(
         source_csv=args.train_source_csv,
@@ -171,6 +174,12 @@ if __name__ == '__main__':
                         help="Online audio duration in seconds")
     parser.add_argument('--online_seed', type=int, default=42,
                         help="Seed used for online validation sampling")
+    parser.add_argument('--rir_root', type=str, default=None,
+                        help="Root directory of RIR files; disabled by default")
+    parser.add_argument('--rir_prob', type=float, default=0.0,
+                        help="Probability of applying RIR to eligible online sources")
+    parser.add_argument('--rir_room_probs', nargs='+', type=float, default=None,
+                        help="Sampling weights for small/medium/large RIR rooms; defaults to uniform")
     parser.add_argument('--resume_ckpt', type=str, default=None, help="Path to .ckpt to continue training")
     parser.add_argument("--gpus", nargs="+", type=int, help="e.g. --gpus 0 1 2")
 

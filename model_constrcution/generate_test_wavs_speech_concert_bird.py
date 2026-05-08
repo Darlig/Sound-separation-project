@@ -2,13 +2,17 @@
 import argparse
 import csv
 import os
+import random
 
 import librosa
 import numpy as np
 import scipy.io.wavfile as wav
 from tqdm import tqdm
 
+from rir_augment import RIRAugmenter
+
 TARGET_SAMPLE_RATE = 16000
+TARGET_NUM_SAMPLES = TARGET_SAMPLE_RATE * 10
 CATEGORY_FILES = {
     'speech': 'speech_gt.wav',
     'concert': 'concert_gt.wav',
@@ -53,50 +57,86 @@ def parse_csv(csv_path):
     src_names = []
     src_labels = []
     src_snrs = []
+    src_sources = []
 
     with open(csv_path, 'r', encoding='utf-8') as f:
         reader = csv.reader(f, skipinitialspace=True)
-        next(reader)
+        header = next(reader)
+        has_source_columns = any("source" in column.lower() for column in header)
         for row in reader:
             names = []
             labels = []
             snrs = []
-            for i in range(0, len(row), 3):
+            sources = []
+            group_size = 4 if has_source_columns else 3
+            for i in range(0, len(row), group_size):
                 if i < len(row):
                     names.append(row[i])
                 if i + 1 < len(row):
                     labels.append(row[i + 1])
                 if i + 2 < len(row):
                     snrs.append(row[i + 2])
+                if has_source_columns and i + 3 < len(row):
+                    sources.append(row[i + 3])
+                elif i < len(row):
+                    sources.append("")
             src_names.append(names)
             src_labels.append(labels)
             src_snrs.append(snrs)
+            src_sources.append(sources)
 
-    return src_names, src_labels, src_snrs
+    return src_names, src_labels, src_snrs, src_sources
 
 
-def generate_wavs_from_csv(csv_path, output_dir, num_samples=None):
+def generate_wavs_from_csv(
+    csv_path,
+    output_dir,
+    num_samples=None,
+    rir_root=None,
+    rir_prob=0.0,
+    rir_room_probs=None,
+    seed=42,
+):
     os.makedirs(output_dir, exist_ok=True)
 
-    src_names, src_labels, src_snrs = parse_csv(csv_path)
+    src_names, src_labels, src_snrs, src_sources = parse_csv(csv_path)
 
     if num_samples is not None:
         src_names = src_names[:num_samples]
         src_labels = src_labels[:num_samples]
         src_snrs = src_snrs[:num_samples]
+        src_sources = src_sources[:num_samples]
 
     print(f"Generating {len(src_names)} wav files...")
+    rng = random.Random(seed)
+    rir_augmenter = RIRAugmenter(
+        rir_root=rir_root,
+        target_sample_rate=TARGET_SAMPLE_RATE,
+        rir_prob=rir_prob,
+        room_probs=rir_room_probs,
+    )
 
     for idx in tqdm(range(len(src_names))):
         names = src_names[idx]
         labels = src_labels[idx]
         snrs = src_snrs[idx]
+        sources = src_sources[idx]
 
         audios = []
         valid = True
-        for name in names:
+        for source_idx, name in enumerate(names):
             if os.path.exists(name):
-                audios.append(load_wav(name, TARGET_SAMPLE_RATE))
+                label = labels[source_idx] if source_idx < len(labels) else ""
+                source = sources[source_idx] if source_idx < len(sources) else ""
+                audio = load_wav(name, TARGET_SAMPLE_RATE, TARGET_NUM_SAMPLES)
+                audio = rir_augmenter.apply(
+                    audio=audio,
+                    category=label,
+                    source=source,
+                    rng=rng,
+                    target_num_samples=TARGET_NUM_SAMPLES,
+                )
+                audios.append(audio)
             else:
                 print(f"Warning: File not found: {name}")
                 valid = False
@@ -150,7 +190,20 @@ if __name__ == '__main__':
     parser.add_argument('--csv_path', type=str, required=True, help='Path to CSV file')
     parser.add_argument('--output_dir', type=str, default='./test_wavs_speech_concert_bird', help='Output directory')
     parser.add_argument('--num_samples', type=int, default=None, help='Number of samples to generate')
+    parser.add_argument('--rir_root', type=str, default=None, help='Root directory of RIR files; disabled by default')
+    parser.add_argument('--rir_prob', type=float, default=0.0, help='Probability of applying RIR to eligible sources')
+    parser.add_argument('--rir_room_probs', nargs='+', type=float, default=None,
+                        help='Sampling weights for small/medium/large RIR rooms; defaults to uniform')
+    parser.add_argument('--seed', type=int, default=42, help='Random seed for deterministic RIR augmentation')
 
     args = parser.parse_args()
 
-    generate_wavs_from_csv(args.csv_path, args.output_dir, args.num_samples)
+    generate_wavs_from_csv(
+        args.csv_path,
+        args.output_dir,
+        args.num_samples,
+        rir_root=args.rir_root,
+        rir_prob=args.rir_prob,
+        rir_room_probs=args.rir_room_probs,
+        seed=args.seed,
+    )

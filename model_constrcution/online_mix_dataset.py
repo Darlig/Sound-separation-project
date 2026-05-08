@@ -9,6 +9,7 @@ import torch
 from scipy.signal import resample_poly
 from torch.utils.data import Dataset, get_worker_info
 
+from rir_augment import RIRAugmenter
 from utils.utils_library_gpu import RI_split, compute_fft, enframe
 
 
@@ -36,6 +37,9 @@ class OnlineMixDataset(Dataset):
         target_duration=10.0,
         seed=42,
         deterministic=False,
+        rir_root=None,
+        rir_prob=0.0,
+        rir_room_probs=None,
     ):
         self.source_csv = Path(source_csv)
         self.audio_root = Path(audio_root) if audio_root else None
@@ -52,9 +56,15 @@ class OnlineMixDataset(Dataset):
         self.seed = int(seed)
         self.deterministic = bool(deterministic)
         self.window = torch.hamming_window(FRAME_SIZE, periodic=False, dtype=torch.float32)
+        self.rir_augmenter = RIRAugmenter(
+            rir_root=rir_root,
+            target_sample_rate=self.target_sample_rate,
+            rir_prob=rir_prob,
+            room_probs=rir_room_probs,
+        )
 
         self._validate_config()
-        self.category_to_paths = self._load_category_paths()
+        self.category_to_records = self._load_category_records()
 
     def _validate_config(self):
         if self.samples_per_epoch <= 0:
@@ -85,11 +95,11 @@ class OnlineMixDataset(Dataset):
         if self.snr_min > self.snr_max:
             raise ValueError("--snr_min must be <= --snr_max")
 
-    def _load_category_paths(self):
+    def _load_category_records(self):
         if not self.source_csv.exists():
             raise FileNotFoundError(f"Source CSV does not exist: {self.source_csv}")
 
-        category_to_paths = {category: [] for category in CATEGORIES}
+        category_to_records = {category: [] for category in CATEGORIES}
         with self.source_csv.open("r", encoding="utf-8-sig", newline="") as f:
             reader = csv.DictReader(f, skipinitialspace=True)
             if reader.fieldnames is None:
@@ -107,7 +117,7 @@ class OnlineMixDataset(Dataset):
 
             for row_number, row in enumerate(reader, start=2):
                 category = str(row.get("category", "")).strip().lower()
-                if category not in category_to_paths:
+                if category not in category_to_records:
                     raise ValueError(
                         f"Unsupported category '{category}' at {self.source_csv}:{row_number}; "
                         f"expected one of {CATEGORIES}"
@@ -116,16 +126,24 @@ class OnlineMixDataset(Dataset):
                 raw_path = str(row.get(path_column, "")).strip()
                 if not raw_path:
                     raise ValueError(f"Empty audio path at {self.source_csv}:{row_number}")
-                category_to_paths[category].append(self._resolve_audio_path(raw_path))
+                category_to_records[category].append(
+                    {
+                        "path": self._resolve_audio_path(raw_path),
+                        "category": category,
+                        "source": str(row.get("source", "")).strip(),
+                    }
+                )
 
-        empty_categories = [category for category, paths in category_to_paths.items() if not paths]
+        empty_categories = [
+            category for category, records in category_to_records.items() if not records
+        ]
         if empty_categories:
             raise ValueError(
                 f"Source CSV must contain at least one sample for every category; "
                 f"empty categories: {empty_categories}"
             )
 
-        return category_to_paths
+        return category_to_records
 
     def _resolve_audio_path(self, raw_path):
         path = Path(raw_path)
@@ -149,8 +167,16 @@ class OnlineMixDataset(Dataset):
 
         audios = []
         for category in selected_categories:
-            audio_path = rng.choice(self.category_to_paths[category])
-            audios.append(self._load_wav(audio_path, rng))
+            record = rng.choice(self.category_to_records[category])
+            audio = self._load_wav(record["path"], rng)
+            audio = self.rir_augmenter.apply(
+                audio=audio,
+                category=record["category"],
+                source=record["source"],
+                rng=rng,
+                target_num_samples=self.target_num_samples,
+            )
+            audios.append(audio)
 
         mixed_wav, scaled_sources = self._mix_audios(audios, snrs)
         category_targets = {
