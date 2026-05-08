@@ -88,7 +88,7 @@ def load_existing_estimates(output_sample_dir, valid_categories, est_filename_ma
     return estimates, missing_categories
 
 
-def load_separator(ckpt_path, device, chunk_size, istft_mode):
+def load_separator(ckpt_path, device, chunk_size, chunk_frames, istft_mode):
     print("Loading model...")
     model = ComplexMTASSLightning.load_from_checkpoint(
         ckpt_path,
@@ -107,6 +107,7 @@ def load_separator(ckpt_path, device, chunk_size, istft_mode):
         win_inc=256,
         fft_len=512,
         chunk_size=chunk_size,
+        chunk_frames=chunk_frames,
         istft_mode=istft_mode,
         device=device
     )
@@ -288,7 +289,9 @@ class StreamingISTFT:
 
 class RealTimeAudioSeparator:
     def __init__(self, model, win_len=512, win_inc=256, fft_len=512,
-                 chunk_size=32, istft_mode='naive', device='cpu'):
+                 chunk_size=32, chunk_frames=100, istft_mode='naive', device='cpu'):
+        if chunk_frames <= 0:
+            raise ValueError(f"chunk_frames must be positive, got {chunk_frames}")
         self.model = model
         self.model.eval()
         self.device = device
@@ -297,6 +300,7 @@ class RealTimeAudioSeparator:
         self.win_inc = win_inc
         self.fft_len = fft_len
         self.chunk_size = chunk_size
+        self.chunk_frames = chunk_frames
         self.istft_mode = istft_mode
 
         self.stft = StreamingSTFT(win_len, win_inc, fft_len, device)
@@ -370,7 +374,7 @@ class RealTimeAudioSeparator:
 
         os.makedirs(output_dir, exist_ok=True)
 
-        buffer_size = self.win_inc * 100
+        buffer_size = self.win_inc * self.chunk_frames
         speech_output = []
         concert_output = []
         bird_output = []
@@ -435,6 +439,12 @@ def main():
     parser.add_argument('--use_cuda', action='store_true', default=True)
     parser.add_argument('--chunk_size', type=int, default=32, help='Chunk size (frames)')
     parser.add_argument(
+        '--chunk_frames',
+        type=int,
+        default=100,
+        help='Number of STFT hop frames to process per streaming pipeline call',
+    )
+    parser.add_argument(
         '--istft_mode',
         type=str,
         default='naive',
@@ -448,6 +458,7 @@ def main():
     device = torch.device("cuda" if args.use_cuda and torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     print(f"Mode: {args.mode}")
+    print(f"Chunk frames: {args.chunk_frames}")
     print(f"ISTFT mode: {args.istft_mode}")
 
     categories = ['speech', 'concert', 'bird']
@@ -540,7 +551,13 @@ def main():
 
         if should_infer:
             if separator is None:
-                separator = load_separator(args.ckpt_path, device, args.chunk_size, args.istft_mode)
+                separator = load_separator(
+                    args.ckpt_path,
+                    device,
+                    args.chunk_size,
+                    args.chunk_frames,
+                    args.istft_mode,
+                )
 
             mixture_path = os.path.join(sample_dir, 'mixture.wav')
             speech_es, concert_es, bird_es = separator.process_file(mixture_path, output_sample_dir, fs)
