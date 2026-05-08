@@ -226,19 +226,29 @@ def load_trial_audios(sources_by_category):
     return audios_by_category
 
 
-def make_segment(active_categories, sources_by_category, audios_by_category):
+def scale_trial_sources(order, sources_by_category, audios_by_category):
+    audios = [audios_by_category[category] for category in order]
+    snrs = [sources_by_category[category].snr for category in order]
+    _, scaled_sources = mix_audios(audios, snrs)
+    return {
+        category: scaled_source
+        for category, scaled_source in zip(order, scaled_sources)
+    }
+
+
+def make_segment(active_categories, scaled_audios_by_category):
     import numpy as np
 
-    audios = [audios_by_category[category] for category in active_categories]
-    snrs = [sources_by_category[category].snr for category in active_categories]
-    mixed_wav, scaled_sources = mix_audios(audios, snrs)
-
     category_wavs = {
-        category: np.zeros_like(mixed_wav) for category in CATEGORIES
+        category: np.zeros_like(next(iter(scaled_audios_by_category.values())))
+        for category in CATEGORIES
     }
-    for category, scaled_source in zip(active_categories, scaled_sources):
-        category_wavs[category] += scaled_source
+    for category in active_categories:
+        category_wavs[category] += scaled_audios_by_category[category]
 
+    mixed_wav = np.zeros_like(next(iter(scaled_audios_by_category.values())))
+    for category in active_categories:
+        mixed_wav += category_wavs[category]
     return mixed_wav, category_wavs
 
 
@@ -246,6 +256,11 @@ def make_serial_trial(spec):
     import numpy as np
 
     audios_by_category = load_trial_audios(spec.sources_by_category)
+    scaled_audios_by_category = scale_trial_sources(
+        order=spec.order,
+        sources_by_category=spec.sources_by_category,
+        audios_by_category=audios_by_category,
+    )
     mixture_segments = []
     category_segments = {category: [] for category in CATEGORIES}
 
@@ -253,8 +268,7 @@ def make_serial_trial(spec):
         active_categories = spec.order[:mix_level]
         mixed_wav, category_wavs = make_segment(
             active_categories=active_categories,
-            sources_by_category=spec.sources_by_category,
-            audios_by_category=audios_by_category,
+            scaled_audios_by_category=scaled_audios_by_category,
         )
         mixture_segments.append(mixed_wav)
         for category in CATEGORIES:
@@ -270,10 +284,14 @@ def make_serial_trial(spec):
 
 def make_single_segment_trial(spec):
     audios_by_category = load_trial_audios(spec.sources_by_category)
-    return make_segment(
-        active_categories=spec.active_categories,
+    scaled_audios_by_category = scale_trial_sources(
+        order=spec.order,
         sources_by_category=spec.sources_by_category,
         audios_by_category=audios_by_category,
+    )
+    return make_segment(
+        active_categories=spec.active_categories,
+        scaled_audios_by_category=scaled_audios_by_category,
     )
 
 
