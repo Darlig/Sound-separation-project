@@ -88,7 +88,7 @@ def load_existing_estimates(output_sample_dir, valid_categories, est_filename_ma
     return estimates, missing_categories
 
 
-def load_separator(ckpt_path, device, chunk_size):
+def load_separator(ckpt_path, device, chunk_size, istft_mode):
     print("Loading model...")
     model = ComplexMTASSLightning.load_from_checkpoint(
         ckpt_path,
@@ -107,6 +107,7 @@ def load_separator(ckpt_path, device, chunk_size):
         win_inc=256,
         fft_len=512,
         chunk_size=chunk_size,
+        istft_mode=istft_mode,
         device=device
     )
 
@@ -194,21 +195,34 @@ class StreamingSTFT:
 
 
 class StreamingISTFT:
-    def __init__(self, win_len=512, win_inc=256, fft_len=512, device='cpu'):
+    def __init__(self, win_len=512, win_inc=256, fft_len=512, device='cpu',
+                 mode='naive', eps=1e-8):
+        if mode not in ('naive', 'normalized'):
+            raise ValueError(f"Unsupported ISTFT mode: {mode}")
         self.win_len = win_len
         self.win_inc = win_inc
         self.fft_len = fft_len
         self.device = device
+        self.mode = mode
+        self.eps = eps
 
         self.window = torch.hamming_window(win_len, device=device)
         self.output_buffer = torch.zeros(win_len, device=device)
         self.prev_samples = torch.zeros(win_len - win_inc, device=device)
+        self.audio_buffer = torch.zeros(win_len, device=device)
+        self.norm_buffer = torch.zeros(win_len, device=device)
+        self.window_square = self.window ** 2
 
     def reset(self):
         self.output_buffer = torch.zeros(self.win_len, device=self.device)
         self.prev_samples = torch.zeros(self.win_len - self.win_inc, device=self.device)
+        self.audio_buffer = torch.zeros(self.win_len, device=self.device)
+        self.norm_buffer = torch.zeros(self.win_len, device=self.device)
 
     def process(self, spec_frames):
+        if self.mode == 'normalized':
+            return self._process_normalized(spec_frames)
+
         num_frames = spec_frames.shape[-1]
 
         output_samples = []
@@ -229,7 +243,40 @@ class StreamingISTFT:
             return torch.cat(output_samples, dim=0).cpu().numpy()
         return None
 
+    def _process_normalized(self, spec_frames):
+        output_samples = []
+
+        for i in range(spec_frames.shape[-1]):
+            spec = spec_frames[..., i]
+            frame = torch.fft.irfft(spec, n=self.fft_len)[:self.win_len]
+
+            self.audio_buffer += frame * self.window
+            self.norm_buffer += self.window_square
+
+            out = self.audio_buffer[:self.win_inc].clone()
+            norm = torch.clamp(self.norm_buffer[:self.win_inc].clone(), min=self.eps)
+            output_samples.append(out / norm)
+
+            self.audio_buffer = torch.roll(self.audio_buffer, -self.win_inc)
+            self.norm_buffer = torch.roll(self.norm_buffer, -self.win_inc)
+            self.audio_buffer[-self.win_inc:] = 0
+            self.norm_buffer[-self.win_inc:] = 0
+
+        if output_samples:
+            return torch.cat(output_samples, dim=0).cpu().numpy()
+        return None
+
     def flush(self):
+        if self.mode == 'normalized':
+            tail = self.audio_buffer[:self.win_len - self.win_inc].clone()
+            norm = torch.clamp(
+                self.norm_buffer[:self.win_len - self.win_inc].clone(),
+                min=self.eps,
+            )
+            self.audio_buffer.zero_()
+            self.norm_buffer.zero_()
+            return (tail / norm).cpu().numpy()
+
         if self.prev_samples.numel() == 0:
             return None
 
@@ -241,7 +288,7 @@ class StreamingISTFT:
 
 class RealTimeAudioSeparator:
     def __init__(self, model, win_len=512, win_inc=256, fft_len=512,
-                 chunk_size=32, device='cpu'):
+                 chunk_size=32, istft_mode='naive', device='cpu'):
         self.model = model
         self.model.eval()
         self.device = device
@@ -250,11 +297,12 @@ class RealTimeAudioSeparator:
         self.win_inc = win_inc
         self.fft_len = fft_len
         self.chunk_size = chunk_size
+        self.istft_mode = istft_mode
 
         self.stft = StreamingSTFT(win_len, win_inc, fft_len, device)
-        self.istft_speech = StreamingISTFT(win_len, win_inc, fft_len, device)
-        self.istft_concert = StreamingISTFT(win_len, win_inc, fft_len, device)
-        self.istft_bird = StreamingISTFT(win_len, win_inc, fft_len, device)
+        self.istft_speech = StreamingISTFT(win_len, win_inc, fft_len, device, mode=istft_mode)
+        self.istft_concert = StreamingISTFT(win_len, win_inc, fft_len, device, mode=istft_mode)
+        self.istft_bird = StreamingISTFT(win_len, win_inc, fft_len, device, mode=istft_mode)
 
     def reset(self):
         self.stft.reset()
@@ -386,6 +434,13 @@ def main():
     )
     parser.add_argument('--use_cuda', action='store_true', default=True)
     parser.add_argument('--chunk_size', type=int, default=32, help='Chunk size (frames)')
+    parser.add_argument(
+        '--istft_mode',
+        type=str,
+        default='naive',
+        choices=['naive', 'normalized'],
+        help='Streaming ISTFT mode. naive preserves the previous behavior; normalized applies window-square compensation.',
+    )
     parser.add_argument('--num_samples', type=int, default=None, help='Number of samples to test')
 
     args = parser.parse_args()
@@ -393,6 +448,7 @@ def main():
     device = torch.device("cuda" if args.use_cuda and torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     print(f"Mode: {args.mode}")
+    print(f"ISTFT mode: {args.istft_mode}")
 
     categories = ['speech', 'concert', 'bird']
     gt_filename_map = {
@@ -484,7 +540,7 @@ def main():
 
         if should_infer:
             if separator is None:
-                separator = load_separator(args.ckpt_path, device, args.chunk_size)
+                separator = load_separator(args.ckpt_path, device, args.chunk_size, args.istft_mode)
 
             mixture_path = os.path.join(sample_dir, 'mixture.wav')
             speech_es, concert_es, bird_es = separator.process_file(mixture_path, output_sample_dir, fs)
