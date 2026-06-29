@@ -73,7 +73,7 @@ def main(args):
         filename="{epoch:04d}-{val_loss:.6f}",
         monitor="val_loss",
         mode="min",
-        save_top_k=5,
+        save_top_k=50,
         save_last=True,
     )
 

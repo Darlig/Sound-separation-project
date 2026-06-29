@@ -125,13 +125,13 @@ def main():
 
             if result == "copied":
                 copied_files += 1
-                print(f"[copied] {sample_name}/{filename}")
+                #print(f"[copied] {sample_name}/{filename}")
             elif result == "exists":
                 existing_files += 1
-                print(f"[skip exists] {sample_name}/{filename}")
+                #print(f"[skip exists] {sample_name}/{filename}")
             else:
                 missing_source_files += 1
-                print(f"[missing file] {sample_name}/{filename}")
+                #print(f"[missing file] {sample_name}/{filename}")
 
     print("\n" + "=" * 60)
     print("Copy GT Summary")
